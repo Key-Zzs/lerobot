@@ -1,0 +1,3 @@
+[submodule "dual_arm_data_collection/agilex_teleop"]
+	path = dual_arm_data_collection/agilex_teleop
+	url = https://github.com/Key-Zzs/agilex_teleop.git
