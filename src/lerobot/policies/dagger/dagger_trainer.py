@@ -244,6 +244,7 @@ def train_dagger(cfg: DAggerPipelineConfig) -> None:
                 robot_observation_processor=robot_observation_processor,
                 beta=beta,
                 rng=rng,
+                log_dir=cfg.output_dir,
             )
 
             rollout_dataset.finalize()
@@ -345,12 +346,26 @@ def train_dagger(cfg: DAggerPipelineConfig) -> None:
         logging.info("DAgger training completed. Output dir: %s", cfg.output_dir)
 
     finally:
-        if expert is not None:
+        # Mirror the record flow: prefer a safe reset and avoid disconnecting by default,
+        # because some robot/teleop stacks treat disconnect as an emergency stop.
+        reset_on_finish = getattr(cfg, "reset_on_finish", True)
+        disconnect_on_finish = getattr(cfg, "disconnect_on_finish", False)
+
+        if reset_on_finish and robot is not None:
             try:
-                expert.disconnect()
+                robot.reset()
             except Exception:  # noqa: BLE001
-                logging.exception("Failed to disconnect expert cleanly.")
-        try:
-            robot.disconnect()
-        except Exception:  # noqa: BLE001
-            logging.exception("Failed to disconnect robot cleanly.")
+                logging.exception("Failed to reset robot cleanly.")
+
+        if disconnect_on_finish:
+            if expert is not None:
+                try:
+                    expert.disconnect()
+                except Exception:  # noqa: BLE001
+                    logging.exception("Failed to disconnect expert cleanly.")
+            try:
+                robot.disconnect()
+            except Exception:  # noqa: BLE001
+                logging.exception("Failed to disconnect robot cleanly.")
+        else:
+            logging.info("[INFO] Skip expert/robot disconnect on finish to avoid emergency stop.")
