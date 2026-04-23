@@ -3,4 +3,4 @@
 	url = https://github.com/Key-Zzs/agilex_teleop.git
 [submodule "dual_arm_data_collection/lerobot_dual_arm_teleop"]
 	path = dual_arm_data_collection/lerobot_dual_arm_teleop
-	url = https://github.com/Shenzhaolong1330/dual_arm_teleop.git
+	url = https://github.com/Key-Zzs/dual_arm_teleop.git
