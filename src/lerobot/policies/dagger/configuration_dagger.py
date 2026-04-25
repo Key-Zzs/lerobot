@@ -89,9 +89,9 @@ class DAggerTrainingConfig:
 
 @dataclass
 class DAggerPipelineConfig:
-    robot: RobotConfig
     policy: PreTrainedConfig
     dataset: DAggerDatasetConfig
+    robot: RobotConfig | None = None
     rollout: DAggerRolloutConfig = field(default_factory=DAggerRolloutConfig)
     expert: DAggerExpertConfig = field(default_factory=DAggerExpertConfig)
     beta: DAggerBetaConfig = field(default_factory=DAggerBetaConfig)
@@ -142,41 +142,10 @@ class DAggerPipelineConfig:
             else:
                 self.dataset.aggregated_repo_id = f"{self.dataset.seed_repo_id}_dagger"
 
-        if self.expert.mode not in {"teleop", "callable"}:
-            raise ValueError(
-                "expert.mode must be one of {'teleop', 'callable'}. "
-                f"Got {self.expert.mode!r}."
-            )
-        if self.expert.mode == "teleop" and self.expert.teleop is None:
-            raise ValueError("expert.teleop must be provided when expert.mode='teleop'.")
-        if self.expert.mode == "callable" and not self.expert.callable_path:
-            raise ValueError("expert.callable_path must be provided when expert.mode='callable'.")
-
-        for key, val in {
-            "beta_start": self.beta.beta_start,
-            "beta_end": self.beta.beta_end,
-        }.items():
-            if val < 0.0 or val > 1.0:
-                raise ValueError(f"{key} must be in [0, 1], got {val}.")
-
-        if self.beta.schedule not in {"linear", "exponential", "constant"}:
-            raise ValueError(
-                "beta.schedule must be one of {'linear', 'exponential', 'constant'}. "
-                f"Got {self.beta.schedule!r}."
-            )
-
         if self.training.rounds <= 0:
             raise ValueError("training.rounds must be > 0")
         if self.training.steps_per_round <= 0:
             raise ValueError("training.steps_per_round must be > 0")
-        if self.rollout.episodes_per_round <= 0:
-            raise ValueError("rollout.episodes_per_round must be > 0")
-        if self.rollout.episode_time_s <= 0:
-            raise ValueError("rollout.episode_time_s must be > 0")
-        if self.rollout.fps <= 0:
-            raise ValueError("rollout.fps must be > 0")
-        if self.rollout.reset_time_s < 0:
-            raise ValueError("rollout.reset_time_s must be >= 0")
         if self.training.log_freq <= 0:
             raise ValueError("training.log_freq must be > 0")
         if self.dataset.image_writer_processes < 0:
