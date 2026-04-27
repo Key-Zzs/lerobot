@@ -1,6 +1,9 @@
 from dataclasses import dataclass, field
+from pathlib import Path
 
-from lerobot.configs.policies import PreTrainedConfig
+import draccus
+
+from lerobot.configs.policies import CONFIG_NAME, PreTrainedConfig
 from lerobot.configs.types import FeatureType, NormalizationMode
 from lerobot.optim.optimizers import AdamWConfig
 from lerobot.policies.act.configuration_act import ACTConfig
@@ -118,3 +121,14 @@ class FusedACTConfig(PreTrainedConfig):
     @property
     def reward_delta_indices(self) -> None:
         return None
+
+    def _save_pretrained(self, save_directory: Path) -> None:
+        encoded = draccus.encode(self)
+        # ACTConfig is not registered as a draccus choice class, so nested
+        # ACT configs must be saved without the discriminator field.
+        for sub_cfg in encoded.get("sub_configs", []):
+            if isinstance(sub_cfg, dict):
+                sub_cfg.pop("type", None)
+        with open(save_directory / CONFIG_NAME, "w") as f:
+            with draccus.config_type("json"):
+                draccus.dump(encoded, f, indent=4)
