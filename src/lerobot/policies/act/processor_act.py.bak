@@ -18,7 +18,6 @@ from typing import Any
 import torch
 
 from lerobot.policies.act.configuration_act import ACTConfig
-from lerobot.policies.act.configuration_fused_act import FusedACTConfig
 from lerobot.processor import (
     AddBatchDimensionProcessorStep,
     DeviceProcessorStep,
@@ -72,65 +71,6 @@ def make_act_pre_post_processors(
         DeviceProcessorStep(device="cpu"),
     ]
 
-    return (
-        PolicyProcessorPipeline[dict[str, Any], dict[str, Any]](
-            steps=input_steps,
-            name=POLICY_PREPROCESSOR_DEFAULT_NAME,
-        ),
-        PolicyProcessorPipeline[PolicyAction, PolicyAction](
-            steps=output_steps,
-            name=POLICY_POSTPROCESSOR_DEFAULT_NAME,
-            to_transition=policy_action_to_transition,
-            to_output=transition_to_policy_action,
-        ),
-    )
-
-# processor_act.py 中新增函数
-def make_fused_act_pre_post_processors(
-    config: FusedACTConfig,
-    dataset_stats: dict | None = None,
-) -> tuple:
-    """
-    为 FusedACTPolicy 构建预处理和后处理流水线。
-    由于 FusedACTPolicy 需要的输入特征 = 所有相机图像 + 状态，我们可以基于第一个子配置的特征构建标准化。
-    """
-    from lerobot.processor import (
-        AddBatchDimensionProcessorStep,
-        DeviceProcessorStep,
-        NormalizerProcessorStep,
-        PolicyAction,
-        PolicyProcessorPipeline,
-        RenameObservationsProcessorStep,
-        UnnormalizerProcessorStep,
-    )
-    from lerobot.utils.constants import POLICY_PREPROCESSOR_DEFAULT_NAME, POLICY_POSTPROCESSOR_DEFAULT_NAME
-
-    # 收集所有 input_features（所有子策略的 image_features 去重，加上状态特征）
-    all_input_features = {}
-    for sub_cfg in config.sub_configs:
-        all_input_features.update(sub_cfg.input_features)
-    # 输出特征沿用第一个子策略的 output_features
-    output_features = config.sub_configs[0].output_features
-
-    input_steps = [
-        RenameObservationsProcessorStep(rename_map={}),
-        AddBatchDimensionProcessorStep(),
-        DeviceProcessorStep(device=config.device),
-        NormalizerProcessorStep(
-            features={**all_input_features, **output_features},
-            norm_map=config.sub_configs[0].normalization_mapping,
-            stats=dataset_stats,
-            device=config.device,
-        ),
-    ]
-    output_steps = [
-        UnnormalizerProcessorStep(
-            features=output_features,
-            norm_map=config.sub_configs[0].normalization_mapping,
-            stats=dataset_stats,
-        ),
-        DeviceProcessorStep(device="cpu"),
-    ]
     return (
         PolicyProcessorPipeline[dict[str, Any], dict[str, Any]](
             steps=input_steps,
