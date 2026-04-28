@@ -30,6 +30,9 @@ class FusedACTConfig(PreTrainedConfig):
     fuser_hidden_dim: int = 256
     # 融合器输出维度 = 子策略个数（此处固定为3）
     num_sub_policies: int = 3
+    # Action chunk settings forwarded to each internal ACT policy.
+    chunk_size: int = 100
+    n_action_steps: int = 100
 
     # 当前训练阶段： "sub_policy_0", "sub_policy_1", "sub_policy_2", "fuser"
     training_stage: str = "sub_policy_0"
@@ -83,6 +86,8 @@ class FusedACTConfig(PreTrainedConfig):
                 output_features=self.output_features,
                 device=self.device,
                 use_amp=self.use_amp,
+                chunk_size=self.chunk_size,
+                n_action_steps=self.n_action_steps,
                 push_to_hub=False,
                 normalization_mapping=self.normalization_mapping,
             )
@@ -116,7 +121,7 @@ class FusedACTConfig(PreTrainedConfig):
     def action_delta_indices(self) -> list:
         if self.sub_configs:
             return self.sub_configs[0].action_delta_indices
-        return list(range(100))
+        return list(range(self.chunk_size))
 
     @property
     def reward_delta_indices(self) -> None:
