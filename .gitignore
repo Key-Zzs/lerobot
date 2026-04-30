@@ -180,3 +180,6 @@ outputs/
 *.part
 
 dual_arm_teleop-4d884f24376f8352bffcf2d3f72283737d05733a/
+
+# AI tmp
+.codex
