@@ -14,6 +14,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 from dataclasses import dataclass, field
+from typing import Literal
 
 from lerobot.configs.policies import PreTrainedConfig
 from lerobot.configs.types import NormalizationMode
@@ -131,6 +132,12 @@ class ACTConfig(PreTrainedConfig):
     # Training and loss computation.
     dropout: float = 0.1
     kl_weight: float = 10.0
+    # `step_wise`: use the dataset action chunk exactly as stored.
+    # `chunk_wise`: convert a step-wise delta action chunk into a chunk-wise delta action chunk at training time.
+    action_delta_alignment: Literal["step_wise", "chunk_wise"] = "step_wise"
+    # Flattened action feature names for the `action` tensor. Used only for training-time label conversion
+    # when `action_delta_alignment="chunk_wise"`. `step_wise` keeps the original action chunk unchanged.
+    action_feature_names: tuple[str, ...] = ()
 
     # Training preset
     optimizer_lr: float = 1e-5
@@ -158,6 +165,11 @@ class ACTConfig(PreTrainedConfig):
         if self.n_obs_steps != 1:
             raise ValueError(
                 f"Multiple observation steps not handled yet. Got `nobs_steps={self.n_obs_steps}`"
+            )
+        if self.action_delta_alignment not in {"step_wise", "chunk_wise"}:
+            raise ValueError(
+                "`action_delta_alignment` must be either 'step_wise' or 'chunk_wise'. "
+                f"Got {self.action_delta_alignment}."
             )
 
     def get_optimizer_preset(self) -> AdamWConfig:

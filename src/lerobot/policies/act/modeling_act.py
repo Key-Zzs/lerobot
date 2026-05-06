@@ -33,6 +33,7 @@ from torch import Tensor, nn
 from torchvision.models._utils import IntermediateLayerGetter
 from torchvision.ops.misc import FrozenBatchNorm2d
 
+from lerobot.policies.act.action_delta_utils import convert_stepwise_to_chunkwise_actions
 from lerobot.policies.act.configuration_act import ACTConfig
 from lerobot.policies.pretrained import PreTrainedPolicy
 from lerobot.utils.constants import ACTION, OBS_ENV_STATE, OBS_IMAGES, OBS_STATE
@@ -134,6 +135,11 @@ class ACTPolicy(PreTrainedPolicy):
 
     def forward(self, batch: dict[str, Tensor]) -> tuple[Tensor, dict]:
         """Run the batch through the model and compute the loss for training or validation."""
+        # Training-only hook:
+        # - `step_wise` keeps labels exactly as stored in the dataset.
+        # - `chunk_wise` rewrites only `batch["action"]` before loss computation.
+        # Inference paths (`select_action`, temporal ensembling, execution) never call this helper.
+        batch = self._prepare_training_batch(batch)
         if self.config.image_features:
             batch = dict(batch)  # shallow copy so that adding a key doesn't modify the original
             batch[OBS_IMAGES] = [batch[key] for key in self.config.image_features]
@@ -159,6 +165,46 @@ class ACTPolicy(PreTrainedPolicy):
             loss = l1_loss
 
         return loss, loss_dict
+
+    def _prepare_training_batch(self, batch: dict[str, Tensor]) -> dict[str, Tensor]:
+        if self.config.action_delta_alignment == "step_wise":
+            return batch
+
+        if ACTION not in batch:
+            raise ValueError("`batch['action']` is required when `action_delta_alignment='chunk_wise'`.")
+
+        action_feature_names = self._get_action_feature_names()
+        converted_batch = dict(batch)
+        # Only the supervision target is converted. `action_is_pad` and the observation tensors are reused
+        # unchanged so the existing masking and model inputs keep their original behavior.
+        converted_batch[ACTION] = convert_stepwise_to_chunkwise_actions(batch[ACTION], action_feature_names)
+        return converted_batch
+
+    def _get_action_feature_names(self) -> tuple[str, ...]:
+        if self.config.action_feature_names:
+            return self.config.action_feature_names
+
+        inferred_names: list[str] = []
+        # Some training setups expose the flattened `action` tensor plus per-dimension scalar features in
+        # `output_features`. When available, we recover the scalar feature names here so chunk-wise conversion
+        # can identify xyz / rotation / gripper channels reliably.
+        for feature_name, feature in self.config.output_features.items():
+            if feature_name == ACTION or feature.type != self.config.action_feature.type:
+                continue
+            if len(feature.shape) != 1 or feature.shape[0] != 1:
+                raise ValueError(
+                    "Unable to infer per-dimension action feature names from `output_features`. "
+                    "Please populate `ACTConfig.action_feature_names`."
+                )
+            inferred_names.append(feature_name.removeprefix(f"{ACTION}."))
+
+        if len(inferred_names) == self.config.action_feature.shape[0]:
+            return tuple(inferred_names)
+
+        raise ValueError(
+            "ACT chunk-wise training requires action feature names so the label conversion can identify "
+            "end-effector pose channels. Please set `ACTConfig.action_feature_names`."
+        )
 
 
 class ACTTemporalEnsembler:
