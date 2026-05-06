@@ -19,6 +19,7 @@ As per Learning Fine-Grained Bimanual Manipulation with Low-Cost Hardware (https
 The majority of changes here involve removing unused code, unifying naming, and adding helpful comments.
 """
 
+import logging
 import math
 from collections import deque
 from collections.abc import Callable
@@ -34,6 +35,7 @@ from torchvision.models._utils import IntermediateLayerGetter
 from torchvision.ops.misc import FrozenBatchNorm2d
 
 from lerobot.policies.act.action_delta_utils import convert_stepwise_to_chunkwise_actions
+from lerobot.policies.act.action_inference_utils import decode_chunkwise_actions_to_absolute_actions
 from lerobot.policies.act.configuration_act import ACTConfig
 from lerobot.policies.pretrained import PreTrainedPolicy
 from lerobot.utils.constants import ACTION, OBS_ENV_STATE, OBS_IMAGES, OBS_STATE
@@ -66,6 +68,10 @@ class ACTPolicy(PreTrainedPolicy):
         if config.temporal_ensemble_coeff is not None:
             self.temporal_ensembler = ACTTemporalEnsembler(config.temporal_ensemble_coeff, config.chunk_size)
 
+        self._logged_inference_alignment = False
+        self._logged_chunk_ref_pose = False
+        self._logged_temporal_ensemble_space = False
+        self._logged_select_action_semantics = False
         self.reset()
 
     def get_optim_params(self) -> dict:
@@ -97,7 +103,12 @@ class ACTPolicy(PreTrainedPolicy):
             self._action_queue = deque([], maxlen=self.config.n_action_steps)
 
     @torch.no_grad()
-    def select_action(self, batch: dict[str, Tensor]) -> Tensor:
+    def select_action(
+        self,
+        batch: dict[str, Tensor],
+        raw_observation: dict[str, Tensor] | None = None,
+        postprocessor: Callable[[Tensor], Tensor] | None = None,
+    ) -> Tensor:
         """Select a single action given environment observations.
 
         This method wraps `select_actions` in order to return one action at a time for execution in the
@@ -105,24 +116,48 @@ class ACTPolicy(PreTrainedPolicy):
         queue is empty.
         """
         self.eval()  # keeping the policy in eval mode as it could be set to train mode while queue is consumed
+        self._log_inference_alignment_once()
 
         if self.config.temporal_ensemble_coeff is not None:
-            actions = self.predict_action_chunk(batch)
+            # `predict_action_chunk` is the semantic boundary for chunk-wise inference:
+            # - `step_wise`: returns the model output as-is (delta actions).
+            # - `chunk_wise`: returns an already-decoded absolute target chunk.
+            # Temporal ensembling therefore stays generic and simply blends whatever action space was chosen
+            # upstream, without needing chunk-wise-specific math inside `ACTTemporalEnsembler`.
+            actions = self.predict_action_chunk(
+                batch,
+                raw_observation=raw_observation,
+                postprocessor=postprocessor,
+            )
+            if self._uses_chunkwise_action_alignment() and not self._logged_temporal_ensemble_space:
+                logging.info("ACT temporal ensemble is operating in absolute action space for chunk-wise inference.")
+                self._logged_temporal_ensemble_space = True
             action = self.temporal_ensembler.update(actions)
+            self._log_select_action_semantics_once()
             return action
 
         # Action queue logic for n_action_steps > 1. When the action_queue is depleted, populate it by
         # querying the policy.
         if len(self._action_queue) == 0:
-            actions = self.predict_action_chunk(batch)[:, : self.config.n_action_steps]
+            actions = self.predict_action_chunk(
+                batch,
+                raw_observation=raw_observation,
+                postprocessor=postprocessor,
+            )[:, : self.config.n_action_steps]
 
             # `self.model.forward` returns a (batch_size, n_action_steps, action_dim) tensor, but the queue
             # effectively has shape (n_action_steps, batch_size, *), hence the transpose.
             self._action_queue.extend(actions.transpose(0, 1))
+        self._log_select_action_semantics_once()
         return self._action_queue.popleft()
 
     @torch.no_grad()
-    def predict_action_chunk(self, batch: dict[str, Tensor]) -> Tensor:
+    def predict_action_chunk(
+        self,
+        batch: dict[str, Tensor],
+        raw_observation: dict[str, Tensor] | None = None,
+        postprocessor: Callable[[Tensor], Tensor] | None = None,
+    ) -> Tensor:
         """Predict a chunk of actions given environment observations."""
         self.eval()
 
@@ -131,7 +166,26 @@ class ACTPolicy(PreTrainedPolicy):
             batch[OBS_IMAGES] = [batch[key] for key in self.config.image_features]
 
         actions = self.model(batch)[0]
-        return actions
+        if not self._uses_chunkwise_action_alignment():
+            return actions
+
+        # Chunk-wise checkpoints predict pose deltas relative to the chunk start, not per-step executable
+        # deltas. We therefore need both the current robot pose (`raw_observation`) and the postprocessor:
+        # the former provides the chunk reference pose, while the latter moves the predicted deltas back into
+        # the same physical units / ranges as the observation before any pose composition happens.
+        if raw_observation is None:
+            raise ValueError(
+                "ACT chunk-wise inference requires the current raw `observation.state` so the predicted chunk "
+                "can be decoded against the chunk reference pose."
+            )
+        if postprocessor is None:
+            raise ValueError(
+                "ACT chunk-wise inference requires the action postprocessor so the predicted chunk can be "
+                "decoded in absolute action space before execution."
+            )
+
+        decoded_actions = self._decode_chunkwise_action_chunk(actions, raw_observation, postprocessor)
+        return decoded_actions
 
     def forward(self, batch: dict[str, Tensor]) -> tuple[Tensor, dict]:
         """Run the batch through the model and compute the loss for training or validation."""
@@ -202,9 +256,110 @@ class ACTPolicy(PreTrainedPolicy):
             return tuple(inferred_names)
 
         raise ValueError(
-            "ACT chunk-wise training requires action feature names so the label conversion can identify "
-            "end-effector pose channels. Please set `ACTConfig.action_feature_names`."
+            "ACT chunk-wise action alignment requires action feature names so end-effector pose channels can "
+            "be identified reliably. Please set `ACTConfig.action_feature_names`."
         )
+
+    def _get_observation_state_feature_names(self) -> tuple[str, ...]:
+        if self.config.observation_state_feature_names:
+            return self.config.observation_state_feature_names
+
+        if self.config.robot_state_feature is None:
+            raise ValueError(
+                "ACT chunk-wise inference requires `observation.state` as a policy input so the current "
+                "absolute end-effector pose can be extracted."
+            )
+
+        inferred_names: list[str] = []
+        for feature_name, feature in self.config.input_features.items():
+            if feature_name == OBS_STATE or feature.type != self.config.robot_state_feature.type:
+                continue
+            if len(feature.shape) != 1 or feature.shape[0] != 1:
+                raise ValueError(
+                    "Unable to infer per-dimension observation state feature names from `input_features`. "
+                    "Please populate `ACTConfig.observation_state_feature_names`."
+                )
+            inferred_names.append(feature_name.removeprefix(f"{OBS_STATE}."))
+
+        if len(inferred_names) == self.config.robot_state_feature.shape[0]:
+            return tuple(inferred_names)
+
+        raise ValueError(
+            "ACT chunk-wise inference requires `observation.state` feature names so the current absolute "
+            "end-effector pose can be extracted. Please set `ACTConfig.observation_state_feature_names`."
+        )
+
+    def _uses_chunkwise_action_alignment(self) -> bool:
+        return self.config.action_delta_alignment == "chunk_wise"
+
+    def _decode_chunkwise_action_chunk(
+        self,
+        actions: Tensor,
+        raw_observation: dict[str, Tensor],
+        postprocessor: Callable[[Tensor], Tensor],
+    ) -> Tensor:
+        if OBS_STATE not in raw_observation:
+            raise ValueError(
+                "ACT chunk-wise inference requires `observation.state` in the raw observation so it can build "
+                "the chunk reference pose."
+            )
+
+        action_feature_names = self._get_action_feature_names()
+        observation_state_feature_names = self._get_observation_state_feature_names()
+        chunk_ref_state = raw_observation[OBS_STATE]
+        if chunk_ref_state.ndim == 1:
+            chunk_ref_state = chunk_ref_state.unsqueeze(0)
+
+        if not self._logged_chunk_ref_pose:
+            logging.info("ACT chunk-wise inference is using `observation.state` as the chunk reference pose source.")
+            self._logged_chunk_ref_pose = True
+
+        # Decode after postprocessing so chunk-wise composition happens in the same physical pose space that
+        # the execution layer already consumes. This avoids mixing normalized delta actions with absolute robot
+        # state values from the current observation.
+        processed_actions = self._postprocess_action_chunk(actions, postprocessor)
+        chunk_ref_state = chunk_ref_state.to(
+            device=processed_actions.device,
+            dtype=processed_actions.dtype,
+        )
+        return decode_chunkwise_actions_to_absolute_actions(
+            processed_actions,
+            chunk_ref_state=chunk_ref_state,
+            action_feature_names=action_feature_names,
+            observation_state_feature_names=observation_state_feature_names,
+        )
+
+    def _postprocess_action_chunk(
+        self, actions: Tensor, postprocessor: Callable[[Tensor], Tensor]
+    ) -> Tensor:
+        # The shared postprocessor operates on (B, action_dim), so chunk-wise inference mirrors the old async
+        # server behavior and applies it step by step. Keeping this in a helper makes it explicit that ACT's
+        # chunk-wise branch is reusing the exact same postprocessing contract as step-wise inference.
+        processed_actions = []
+        for timestep in range(actions.shape[1]):
+            processed_actions.append(postprocessor(actions[:, timestep, :]))
+        return torch.stack(processed_actions, dim=1)
+
+    def _log_inference_alignment_once(self) -> None:
+        if self._logged_inference_alignment:
+            return
+        if self._uses_chunkwise_action_alignment():
+            logging.info(
+                "ACT inference action_delta_alignment=chunk_wise; predicted chunks will be decoded to "
+                "absolute target actions before they are returned."
+            )
+        else:
+            logging.info("ACT inference action_delta_alignment=step_wise; predicted actions keep delta semantics.")
+        self._logged_inference_alignment = True
+
+    def _log_select_action_semantics_once(self) -> None:
+        if self._logged_select_action_semantics:
+            return
+        if self._uses_chunkwise_action_alignment():
+            logging.info("ACT select_action is returning absolute target actions in chunk-wise mode.")
+        else:
+            logging.info("ACT select_action is returning delta actions in step-wise mode.")
+        self._logged_select_action_semantics = True
 
 
 class ACTTemporalEnsembler:

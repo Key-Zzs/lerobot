@@ -61,6 +61,31 @@ class MockPolicy:
         return torch.zeros(batch_size, 20, 6)
 
 
+class MockChunkwiseACTPolicy:
+    name = "act"
+
+    class _Config:
+        robot_type = "dummy_robot"
+        action_delta_alignment = "chunk_wise"
+
+        @property
+        def image_features(self) -> dict[str, PolicyFeature]:
+            return {}
+
+    def __init__(self):
+        self.config = self._Config()
+
+    def predict_action_chunk(
+        self,
+        observation: dict[str, torch.Tensor],
+        raw_observation: dict[str, torch.Tensor] | None = None,
+        postprocessor=None,
+    ) -> torch.Tensor:
+        assert raw_observation is not None
+        assert postprocessor is not None
+        return torch.tensor([[[10.0, 0.0, 0.0, 0.0, 0.0, 0.0]]])
+
+
 @pytest.fixture
 @require_package("grpc")
 def policy_server():
@@ -217,3 +242,16 @@ def test_predict_action_chunk(monkeypatch, policy_server):
     for i, ta in enumerate(timed_actions):
         expected_ts = obs.get_timestamp() + i * policy_server.config.environment_dt
         assert abs(ta.get_timestamp() - expected_ts) < 1e-6
+
+
+def test_predict_action_chunk_skips_second_postprocess_for_chunkwise_act(policy_server):
+    policy_server.policy = MockChunkwiseACTPolicy()
+    policy_server.actions_per_chunk = 1
+    policy_server.preprocessor = lambda obs: obs
+    policy_server.postprocessor = lambda tensor: tensor + 1000.0
+
+    obs = _make_obs(torch.zeros(6), timestep=7)
+    timed_actions = policy_server._predict_action_chunk(obs)
+
+    assert len(timed_actions) == 1
+    torch.testing.assert_close(timed_actions[0].get_action(), torch.tensor([10.0, 0.0, 0.0, 0.0, 0.0, 0.0]))

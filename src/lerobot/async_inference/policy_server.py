@@ -318,9 +318,23 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
             for i, action in enumerate(action_chunk)
         ]
 
-    def _get_action_chunk(self, observation: dict[str, torch.Tensor]) -> torch.Tensor:
+    def _get_action_chunk(
+        self,
+        observation: dict[str, torch.Tensor],
+        raw_observation: dict[str, torch.Tensor] | None = None,
+    ) -> torch.Tensor:
         """Get an action chunk from the policy. The chunk contains only"""
-        chunk = self.policy.predict_action_chunk(observation)
+        if self._uses_act_chunkwise_inference():
+            # Mirror the sync inference path: ACT receives both the normalized model input and the raw
+            # observation/state snapshot so it can decode chunk-wise predictions into absolute targets using
+            # the chunk's own reference pose.
+            chunk = self.policy.predict_action_chunk(
+                observation,
+                raw_observation=raw_observation,
+                postprocessor=self.postprocessor,
+            )
+        else:
+            chunk = self.policy.predict_action_chunk(observation)
         if chunk.ndim != 3:
             chunk = chunk.unsqueeze(0)  # adding batch dimension, now shape is (B, chunk_size, action_dim)
 
@@ -343,6 +357,12 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
             self.lerobot_features,
             self.policy_image_features,
         )
+        # This raw copy is the async equivalent of the sync `predict_action` helper's snapshot. We keep it
+        # before normalization because chunk-wise ACT needs the absolute `observation.state` values, not the
+        # normalized network input, to build a correct chunk reference pose.
+        raw_policy_observation = {
+            key: value.clone() if isinstance(value, torch.Tensor) else value for key, value in observation.items()
+        }
         prepare_time = time.perf_counter() - start_prepare
 
         """2. Apply preprocessor"""
@@ -353,30 +373,33 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
 
         """3. Get action chunk"""
         start_inference = time.perf_counter()
-        action_tensor = self._get_action_chunk(observation)
+        action_tensor = self._get_action_chunk(observation, raw_observation=raw_policy_observation)
         inference_time = time.perf_counter() - start_inference
         self.logger.info(
             f"Preprocessing and inference took {inference_time:.4f}s, action shape: {action_tensor.shape}"
         )
 
         """4. Apply postprocessor"""
-        # Apply postprocessor (handles unnormalization and device movement)
-        # Postprocessor expects (B, action_dim) per action, but we have (B, chunk_size, action_dim)
-        # So we process each action in the chunk individually
         start_postprocess = time.perf_counter()
-        _, chunk_size, _ = action_tensor.shape
+        if self._uses_act_chunkwise_inference():
+            # ACT already postprocesses and decodes chunk-wise predictions to absolute target actions before
+            # returning them here, so the server must not unnormalize the chunk a second time.
+            action_tensor = action_tensor.squeeze(0)
+            self.logger.debug("Chunk-wise ACT action chunk already decoded to absolute action space.")
+        else:
+            # Apply postprocessor (handles unnormalization and device movement)
+            # Postprocessor expects (B, action_dim) per action, but we have (B, chunk_size, action_dim)
+            # So we process each action in the chunk individually.
+            _, chunk_size, _ = action_tensor.shape
+            processed_actions = []
+            for i in range(chunk_size):
+                single_action = action_tensor[:, i, :]
+                processed_action = self.postprocessor(single_action)
+                processed_actions.append(processed_action)
 
-        # Process each action in the chunk
-        processed_actions = []
-        for i in range(chunk_size):
-            # Extract action at timestep i: (B, action_dim)
-            single_action = action_tensor[:, i, :]
-            processed_action = self.postprocessor(single_action)
-            processed_actions.append(processed_action)
-
-        # Stack back to (B, chunk_size, action_dim), then remove batch dim
-        action_tensor = torch.stack(processed_actions, dim=1).squeeze(0)
-        self.logger.debug(f"Postprocessed action shape: {action_tensor.shape}")
+            # Stack back to (B, chunk_size, action_dim), then remove batch dim
+            action_tensor = torch.stack(processed_actions, dim=1).squeeze(0)
+            self.logger.debug(f"Postprocessed action shape: {action_tensor.shape}")
 
         """5. Convert to TimedAction list"""
         action_chunk = self._time_action_chunk(
@@ -405,6 +428,11 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
         """Stop the server"""
         self._reset_server()
         self.logger.info("Server stopping...")
+
+    def _uses_act_chunkwise_inference(self) -> bool:
+        return getattr(self.policy, "name", None) == "act" and (
+            getattr(self.policy.config, "action_delta_alignment", "step_wise") == "chunk_wise"
+        )
 
 
 @draccus.wrap()

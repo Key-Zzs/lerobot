@@ -104,15 +104,36 @@ def predict_action(
     ):
         # Convert to pytorch format: channel first and float32 in [0,1] with batch dimension
         observation = prepare_observation_for_inference(observation, device, task, robot_type)
+        # Keep a copy before the shared preprocessor runs:
+        # - the preprocessed observation is what the network consumes;
+        # - the raw tensorized observation still contains the absolute robot state needed to decode
+        #   chunk-wise ACT outputs against the current chunk reference pose.
+        raw_observation = {
+            key: value.clone() if isinstance(value, torch.Tensor) else value for key, value in observation.items()
+        }
         observation = preprocessor(observation)
 
         # Compute the next action with the policy
         # based on the current observation
-        action = policy.select_action(observation)
-
-        action = postprocessor(action)
+        if _uses_act_chunkwise_inference(policy):
+            # In chunk-wise mode ACT already postprocesses + decodes to absolute target actions internally,
+            # so the outer inference helper must not run the shared postprocessor a second time.
+            action = policy.select_action(
+                observation,
+                raw_observation=raw_observation,
+                postprocessor=postprocessor,
+            )
+        else:
+            action = policy.select_action(observation)
+            action = postprocessor(action)
 
     return action
+
+
+def _uses_act_chunkwise_inference(policy: PreTrainedPolicy) -> bool:
+    return getattr(policy, "name", None) == "act" and (
+        getattr(policy.config, "action_delta_alignment", "step_wise") == "chunk_wise"
+    )
 
 
 def init_keyboard_listener():

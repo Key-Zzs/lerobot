@@ -138,6 +138,9 @@ class ACTConfig(PreTrainedConfig):
     # Flattened action feature names for the `action` tensor. Used only for training-time label conversion
     # when `action_delta_alignment="chunk_wise"`. `step_wise` keeps the original action chunk unchanged.
     action_feature_names: tuple[str, ...] = ()
+    # Flattened `observation.state` feature names. Used only during chunk-wise inference so ACT can recover
+    # the current absolute end-effector pose and decode model outputs into absolute target actions.
+    observation_state_feature_names: tuple[str, ...] = ()
 
     # Training preset
     optimizer_lr: float = 1e-5

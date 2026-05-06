@@ -45,7 +45,7 @@ from lerobot.processor.converters import (
     transition_to_batch,
     transition_to_policy_action,
 )
-from lerobot.utils.constants import ACTION, POLICY_POSTPROCESSOR_DEFAULT_NAME, POLICY_PREPROCESSOR_DEFAULT_NAME
+from lerobot.utils.constants import ACTION, OBS_STATE, POLICY_POSTPROCESSOR_DEFAULT_NAME, POLICY_PREPROCESSOR_DEFAULT_NAME
 
 
 def get_policy_class(name: str) -> type[PreTrainedPolicy]:
@@ -364,11 +364,17 @@ def make_policy(
         cfg.output_features = {key: ft for key, ft in features.items() if ft.type is FeatureType.ACTION}
     if not cfg.input_features:
         cfg.input_features = {key: ft for key, ft in features.items() if key not in cfg.output_features}
-    if cfg.type == "act" and hasattr(cfg, "action_feature_names") and not cfg.action_feature_names and ds_meta is not None:
-        action_feature_spec = ds_meta.features.get(ACTION, {})
-        action_feature_names = tuple(action_feature_spec.get("names", ()))
-        if action_feature_names:
-            cfg.action_feature_names = action_feature_names
+    if cfg.type == "act" and ds_meta is not None:
+        if hasattr(cfg, "action_feature_names") and not cfg.action_feature_names:
+            action_feature_spec = ds_meta.features.get(ACTION, {})
+            action_feature_names = tuple(action_feature_spec.get("names", ()))
+            if action_feature_names:
+                cfg.action_feature_names = action_feature_names
+        if hasattr(cfg, "observation_state_feature_names") and not cfg.observation_state_feature_names:
+            state_feature_spec = ds_meta.features.get(OBS_STATE, {})
+            observation_state_feature_names = tuple(state_feature_spec.get("names", ()))
+            if observation_state_feature_names:
+                cfg.observation_state_feature_names = observation_state_feature_names
     kwargs["config"] = cfg
 
     if cfg.pretrained_path:
