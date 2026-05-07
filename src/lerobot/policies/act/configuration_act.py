@@ -146,10 +146,6 @@ class ACTConfig(PreTrainedConfig):
     # same feature names but store TCP feedback under a compatibility order such as ("x", "y", "z", "rz",
     # "ry", "rx"). Chunk-wise inference uses this hint only when recovering the chunk reference pose.
     observation_state_pose_axis_order: tuple[str, ...] = ("x", "y", "z", "rx", "ry", "rz")
-    # Policy-side diagnostics for locating chunk-wise absolute target drift. This only adds logs/self-checks
-    # in inference and does not change model outputs, decoding, temporal ensemble math, or execution.
-    debug_chunkwise_policy_drift: bool = False
-    debug_chunkwise_policy_drift_every_n: int = 1
 
     # Training preset
     optimizer_lr: float = 1e-5

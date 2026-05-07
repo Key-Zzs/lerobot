@@ -21,6 +21,12 @@ import sys
 from pathlib import Path
 
 import numpy as np
+import torch
+
+from lerobot.policies.act.action_inference_utils import (
+    check_chunkwise_train_decode_inverse,
+    inspect_chunkwise_feature_mapping,
+)
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 SRC_ROOT = REPO_ROOT / "src"
@@ -96,6 +102,14 @@ def _cartesian_action(left_pose=None, right_pose=None) -> dict[str, float]:
         for axis, value in zip(("x", "y", "z", "rx", "ry", "rz"), pose, strict=True):
             action[f"{prefix}.{axis}"] = float(value)
     return action
+
+
+def _act_pose_feature_names(prefix: str) -> tuple[str, ...]:
+    return tuple(
+        f"{arm}_{prefix}.{axis}"
+        for arm in ("left", "right")
+        for axis in ("x", "y", "z", "rx", "ry", "rz")
+    )
 
 
 def test_send_action_cartesian_stepwise_uses_delta_true():
@@ -229,3 +243,45 @@ def test_convert_absolute_pose_to_servo_delta_inverts_server_rotation_compose():
     recovered_delta = NeroDualArm._convert_absolute_pose_to_servo_delta(target_pose, current_pose)
 
     np.testing.assert_allclose(recovered_delta[3:], expected_delta[3:], atol=1e-6)
+
+
+def test_chunkwise_feature_mapping_reports_right_z_indices():
+    action_names = _act_pose_feature_names("delta_ee_pose")
+    observation_names = _act_pose_feature_names("ee_pose")
+
+    mapping = inspect_chunkwise_feature_mapping(
+        action_names,
+        observation_names,
+        observation_state_pose_axis_order=("x", "y", "z", "rz", "ry", "rx"),
+        require_right_arm=True,
+    )
+
+    assert mapping["arms"]["right"]["action"]["z"]["index"] == 8
+    assert mapping["arms"]["right"]["observation_state"]["z"]["index"] == 8
+    assert mapping["arms"]["right"]["observation_state"]["rx"]["effective_feature_name"] == "right_ee_pose.rx"
+
+
+def test_chunkwise_training_transform_and_inference_decode_are_inverse_for_pose_chunk():
+    action_names = _act_pose_feature_names("delta_ee_pose")
+    observation_names = _act_pose_feature_names("ee_pose")
+    stepwise_actions = torch.zeros(1, 5, len(action_names), dtype=torch.float64)
+    stepwise_actions[:, :, 0] = 0.001
+    stepwise_actions[:, :, 2] = -0.0005
+    stepwise_actions[:, :, 6] = 0.002
+    stepwise_actions[:, :, 8] = -0.001
+    stepwise_actions[:, :, 9:12] = torch.tensor([0.01, -0.005, 0.002], dtype=torch.float64)
+    chunk_ref_state = torch.tensor(
+        [[0.1, 0.2, 0.3, 0.0, 0.0, 0.0, 1.0, 2.0, 3.0, 0.2, -0.1, 0.3]],
+        dtype=torch.float64,
+    )
+
+    result = check_chunkwise_train_decode_inverse(
+        stepwise_actions,
+        chunk_ref_state,
+        action_names,
+        observation_names,
+    )
+
+    assert result["ok"] is True
+    assert result["max_abs_error"] < 1e-6
+    assert result["right_z"]["index"] == 8

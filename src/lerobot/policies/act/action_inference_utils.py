@@ -233,11 +233,11 @@ def check_chunkwise_train_decode_inverse(
     right_z = {
         "feature_name": action_feature_names[right_z_index],
         "index": right_z_index,
-        "stepwise_delta": _tensor_trace(stepwise_actions[0, :, right_z_index]),
-        "chunkwise_delta": _tensor_trace(chunkwise_delta[0, :, right_z_index]),
-        "decoded_absolute": _tensor_trace(decoded_absolute[0, :, right_z_index]),
-        "reference_absolute": _tensor_trace(reference_absolute[0, :, right_z_index]),
-        "error": _tensor_trace(error[0, :, right_z_index]),
+        "stepwise_delta": _tensor_preview(stepwise_actions[0, :, right_z_index]),
+        "chunkwise_delta": _tensor_preview(chunkwise_delta[0, :, right_z_index]),
+        "decoded_absolute": _tensor_preview(decoded_absolute[0, :, right_z_index]),
+        "reference_absolute": _tensor_preview(reference_absolute[0, :, right_z_index]),
+        "error": _tensor_preview(error[0, :, right_z_index]),
     }
     return {
         "ok": bool(torch.max(torch.abs(error)).item() < 1e-6),
@@ -318,7 +318,7 @@ def _raise_on_duplicate_indices(arm_name: str, mapping: dict[str, dict]) -> None
         raise ValueError(f"Duplicate pose indices for arm '{arm_name}': {duplicate_indices}.")
 
 
-def _tensor_trace(values: Tensor, limit: int = 12) -> list[float]:
+def _tensor_preview(values: Tensor, limit: int = 12) -> list[float]:
     return [round(float(value), 6) for value in values.detach().cpu()[:limit].tolist()]
 
 
