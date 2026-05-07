@@ -39,7 +39,15 @@ class _ServoRecorder:
         self.left_pose = None if left_pose is None else np.asarray(left_pose, dtype=float)
         self.right_pose = None if right_pose is None else np.asarray(right_pose, dtype=float)
 
-    def servo_p_OL(self, robot_arm: str, pose, delta: bool) -> bool:
+    def servo_p_OL(
+        self,
+        robot_arm: str,
+        pose,
+        delta: bool,
+        debug_target_abs_pose=None,
+        debug_step_idx=None,
+        debug_queue_idx=None,
+    ) -> bool:
         self.calls.append((robot_arm, np.asarray(pose, dtype=float), delta))
         return True
 
@@ -49,16 +57,28 @@ class _ServoRecorder:
     def right_robot_get_ee_pose(self):
         return self.right_pose
 
+    def left_robot_get_servo_p_ol_reference_pose(self):
+        return self.left_pose
 
-def _make_robot(action_delta_alignment: str = "step_wise") -> NeroDualArm:
+    def right_robot_get_servo_p_ol_reference_pose(self):
+        return self.right_pose
+
+
+def _make_robot(
+    action_delta_alignment: str = "step_wise",
+    left_ref=None,
+    right_ref=None,
+    chunkwise_reference_pose_source: str = "servo_ol",
+) -> NeroDualArm:
     robot = NeroDualArm(
         NeroDualArmConfig(
             debug=False,
             cameras={},
             action_delta_alignment=action_delta_alignment,
+            chunkwise_reference_pose_source=chunkwise_reference_pose_source,
         )
     )
-    robot._robot = _ServoRecorder()
+    robot._robot = _ServoRecorder(left_pose=left_ref, right_pose=right_ref)
     robot.is_connected = True
     robot._should_send_action = lambda: True
     return robot
@@ -99,11 +119,10 @@ def test_send_action_cartesian_stepwise_uses_delta_true():
 
 
 def test_send_action_cartesian_chunkwise_converts_absolute_target_to_delta_true():
-    robot = _make_robot("chunk_wise")
-    _set_prev_observation(
-        robot,
-        left_pose=[10.0, 20.0, 30.0, 0.1, 0.2, 0.3],
-        right_pose=[100.0, 200.0, 300.0, -0.2, 0.4, -0.6],
+    robot = _make_robot(
+        "chunk_wise",
+        left_ref=[10.0, 20.0, 30.0, 0.1, 0.2, 0.3],
+        right_ref=[100.0, 200.0, 300.0, -0.2, 0.4, -0.6],
     )
     action = _cartesian_action(
         left_pose=[11.0, 22.0, 33.0, 0.1, 0.2, 0.3],
@@ -120,6 +139,48 @@ def test_send_action_cartesian_chunkwise_converts_absolute_target_to_delta_true(
     assert action["left_delta_ee_pose.x"] == 11.0
 
 
+def test_send_action_cartesian_chunkwise_defaults_to_servo_ol_reference_not_observation():
+    robot = _make_robot(
+        "chunk_wise",
+        left_ref=[10.0, 20.0, 30.0, 0.0, 0.0, 0.0],
+        right_ref=[100.0, 200.0, 300.0, 0.0, 0.0, 0.0],
+    )
+    _set_prev_observation(
+        robot,
+        left_pose=[0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+        right_pose=[0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+    )
+
+    robot.send_action_cartesian(
+        _cartesian_action(
+            left_pose=[11.0, 22.0, 33.0, 0.0, 0.0, 0.0],
+            right_pose=[101.0, 202.0, 303.0, 0.0, 0.0, 0.0],
+        )
+    )
+
+    np.testing.assert_allclose(robot._robot.calls[0][1][:3], [1.0, 2.0, 3.0])
+    np.testing.assert_allclose(robot._robot.calls[1][1][:3], [1.0, 2.0, 3.0])
+
+
+def test_send_action_cartesian_chunkwise_can_use_observation_reference_as_explicit_debug_path():
+    robot = _make_robot("chunk_wise", chunkwise_reference_pose_source="observation")
+    _set_prev_observation(
+        robot,
+        left_pose=[10.0, 20.0, 30.0, 0.0, 0.0, 0.0],
+        right_pose=[100.0, 200.0, 300.0, 0.0, 0.0, 0.0],
+    )
+
+    robot.send_action_cartesian(
+        _cartesian_action(
+            left_pose=[11.0, 22.0, 33.0, 0.0, 0.0, 0.0],
+            right_pose=[101.0, 202.0, 303.0, 0.0, 0.0, 0.0],
+        )
+    )
+
+    np.testing.assert_allclose(robot._robot.calls[0][1][:3], [1.0, 2.0, 3.0])
+    np.testing.assert_allclose(robot._robot.calls[1][1][:3], [1.0, 2.0, 3.0])
+
+
 def test_send_action_defaults_to_stepwise_when_not_configured():
     robot = NeroDualArm(NeroDualArmConfig(debug=False, cameras={}))
     robot._robot = _ServoRecorder()
@@ -134,11 +195,10 @@ def test_send_action_defaults_to_stepwise_when_not_configured():
 
 
 def test_send_action_forwards_mode_to_cartesian_execution():
-    robot = _make_robot("chunk_wise")
-    _set_prev_observation(
-        robot,
-        left_pose=[10.0, 20.0, 30.0, 0.0, 0.0, 0.0],
-        right_pose=[100.0, 200.0, 300.0, 0.0, 0.0, 0.0],
+    robot = _make_robot(
+        "chunk_wise",
+        left_ref=[10.0, 20.0, 30.0, 0.0, 0.0, 0.0],
+        right_ref=[100.0, 200.0, 300.0, 0.0, 0.0, 0.0],
     )
     action = _cartesian_action(
         left_pose=[10.1, 20.2, 30.3, 0.0, 0.0, 0.0],
