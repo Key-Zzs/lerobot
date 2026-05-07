@@ -322,6 +322,7 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
         self,
         observation: dict[str, torch.Tensor],
         raw_observation: dict[str, torch.Tensor] | None = None,
+        debug_step_idx: int | None = None,
     ) -> torch.Tensor:
         """Get an action chunk from the policy. The chunk contains only"""
         if self._uses_act_chunkwise_inference():
@@ -332,6 +333,7 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
                 observation,
                 raw_observation=raw_observation,
                 postprocessor=self.postprocessor,
+                debug_step_idx=debug_step_idx,
             )
         else:
             chunk = self.policy.predict_action_chunk(observation)
@@ -373,7 +375,11 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
 
         """3. Get action chunk"""
         start_inference = time.perf_counter()
-        action_tensor = self._get_action_chunk(observation, raw_observation=raw_policy_observation)
+        action_tensor = self._get_action_chunk(
+            observation,
+            raw_observation=raw_policy_observation,
+            debug_step_idx=observation_t.get_timestep(),
+        )
         inference_time = time.perf_counter() - start_inference
         self.logger.info(
             f"Preprocessing and inference took {inference_time:.4f}s, action shape: {action_tensor.shape}"

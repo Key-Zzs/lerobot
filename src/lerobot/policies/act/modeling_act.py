@@ -36,7 +36,9 @@ from torchvision.ops.misc import FrozenBatchNorm2d
 
 from lerobot.policies.act.action_delta_utils import convert_stepwise_to_chunkwise_actions
 from lerobot.policies.act.action_inference_utils import (
+    check_chunkwise_train_decode_inverse,
     decode_chunkwise_actions_to_absolute_actions,
+    inspect_chunkwise_feature_mapping,
 )
 from lerobot.policies.act.configuration_act import ACTConfig
 from lerobot.policies.pretrained import PreTrainedPolicy
@@ -74,6 +76,9 @@ class ACTPolicy(PreTrainedPolicy):
         self._logged_chunk_ref_pose = False
         self._logged_temporal_ensemble_space = False
         self._logged_select_action_semantics = False
+        self._logged_chunkwise_policy_mapping = False
+        self._logged_chunkwise_inverse_check = False
+        self._policy_debug_step_idx = 0
         self.reset()
 
     def get_optim_params(self) -> dict:
@@ -103,6 +108,7 @@ class ACTPolicy(PreTrainedPolicy):
             self.temporal_ensembler.reset()
         else:
             self._action_queue = deque([], maxlen=self.config.n_action_steps)
+            self._action_queue_metadata = deque([], maxlen=self.config.n_action_steps)
 
     @torch.no_grad()
     def select_action(
@@ -119,6 +125,7 @@ class ACTPolicy(PreTrainedPolicy):
         """
         self.eval()  # keeping the policy in eval mode as it could be set to train mode while queue is consumed
         self._log_inference_alignment_once()
+        debug_step_idx = self._policy_debug_step_idx
 
         if self.config.temporal_ensemble_coeff is not None:
             # `predict_action_chunk` is the semantic boundary for chunk-wise inference:
@@ -130,12 +137,30 @@ class ACTPolicy(PreTrainedPolicy):
                 batch,
                 raw_observation=raw_observation,
                 postprocessor=postprocessor,
+                debug_step_idx=debug_step_idx,
             )
             if self._uses_chunkwise_action_alignment() and not self._logged_temporal_ensemble_space:
                 logging.info("ACT temporal ensemble is operating in absolute action space for chunk-wise inference.")
                 self._logged_temporal_ensemble_space = True
-            action = self.temporal_ensembler.update(actions)
+            self._log_action_tensor_stage(
+                "temporal_ensemble_before_current_step",
+                actions[:, 0],
+                step_idx=debug_step_idx,
+                queue_idx=0,
+            )
+            action = self.temporal_ensembler.update(
+                actions,
+                debug_step_idx=debug_step_idx if self._chunkwise_policy_debug_enabled() else None,
+            )
+            self._log_temporal_ensemble_history(debug_step_idx)
+            self._log_action_tensor_stage(
+                "temporal_ensemble_after_selected_action",
+                action,
+                step_idx=debug_step_idx,
+                queue_idx=0,
+            )
             self._log_select_action_semantics_once()
+            self._policy_debug_step_idx += 1
             return action
 
         # Action queue logic for n_action_steps > 1. When the action_queue is depleted, populate it by
@@ -145,13 +170,28 @@ class ACTPolicy(PreTrainedPolicy):
                 batch,
                 raw_observation=raw_observation,
                 postprocessor=postprocessor,
+                debug_step_idx=debug_step_idx,
             )[:, : self.config.n_action_steps]
 
             # `self.model.forward` returns a (batch_size, n_action_steps, action_dim) tensor, but the queue
             # effectively has shape (n_action_steps, batch_size, *), hence the transpose.
             self._action_queue.extend(actions.transpose(0, 1))
+            self._action_queue_metadata.extend(
+                {"origin_step_idx": debug_step_idx, "queue_idx": queue_idx}
+                for queue_idx in range(actions.shape[1])
+            )
         self._log_select_action_semantics_once()
-        return self._action_queue.popleft()
+        action = self._action_queue.popleft()
+        action_metadata = self._action_queue_metadata.popleft()
+        self._log_action_tensor_stage(
+            "selected_action_from_queue",
+            action,
+            step_idx=debug_step_idx,
+            queue_idx=action_metadata["queue_idx"],
+            extra={"origin_step_idx": action_metadata["origin_step_idx"]},
+        )
+        self._policy_debug_step_idx += 1
+        return action
 
     @torch.no_grad()
     def predict_action_chunk(
@@ -159,6 +199,7 @@ class ACTPolicy(PreTrainedPolicy):
         batch: dict[str, Tensor],
         raw_observation: dict[str, Tensor] | None = None,
         postprocessor: Callable[[Tensor], Tensor] | None = None,
+        debug_step_idx: int | None = None,
     ) -> Tensor:
         """Predict a chunk of actions given environment observations."""
         self.eval()
@@ -186,7 +227,12 @@ class ACTPolicy(PreTrainedPolicy):
                 "decoded in absolute action space before execution."
             )
 
-        decoded_actions = self._decode_chunkwise_action_chunk(actions, raw_observation, postprocessor)
+        decoded_actions = self._decode_chunkwise_action_chunk(
+            actions,
+            raw_observation,
+            postprocessor,
+            debug_step_idx=debug_step_idx,
+        )
         return decoded_actions
 
     def forward(self, batch: dict[str, Tensor]) -> tuple[Tensor, dict]:
@@ -299,6 +345,7 @@ class ACTPolicy(PreTrainedPolicy):
         actions: Tensor,
         raw_observation: dict[str, Tensor],
         postprocessor: Callable[[Tensor], Tensor],
+        debug_step_idx: int | None = None,
     ) -> Tensor:
         if OBS_STATE not in raw_observation:
             raise ValueError(
@@ -311,6 +358,22 @@ class ACTPolicy(PreTrainedPolicy):
         chunk_ref_state = raw_observation[OBS_STATE]
         if chunk_ref_state.ndim == 1:
             chunk_ref_state = chunk_ref_state.unsqueeze(0)
+        debug_step_idx = self._policy_debug_step_idx if debug_step_idx is None else debug_step_idx
+        if self._chunkwise_policy_debug_enabled():
+            self._log_chunkwise_feature_mapping_once(action_feature_names, observation_state_feature_names)
+            self._log_observation_state_pose_stage(
+                "raw_observation_state_decode_source",
+                chunk_ref_state,
+                observation_state_feature_names,
+                step_idx=debug_step_idx,
+            )
+            self._log_action_tensor_stage(
+                "model_raw_predicted_chunkwise_delta_chunk",
+                actions,
+                action_feature_names=action_feature_names,
+                step_idx=debug_step_idx,
+                queue_idx="chunk",
+            )
 
         if not self._logged_chunk_ref_pose:
             logging.info("ACT chunk-wise inference is using `observation.state` as the chunk reference pose source.")
@@ -328,12 +391,39 @@ class ACTPolicy(PreTrainedPolicy):
             device=processed_actions.device,
             dtype=processed_actions.dtype,
         )
+        if self._chunkwise_policy_debug_enabled():
+            self._log_observation_state_pose_stage(
+                "chunk_ref_pose_used_for_decode",
+                chunk_ref_state,
+                observation_state_feature_names,
+                step_idx=debug_step_idx,
+            )
+            self._log_action_tensor_stage(
+                "postprocessed_chunkwise_delta_chunk",
+                processed_actions,
+                action_feature_names=action_feature_names,
+                step_idx=debug_step_idx,
+                queue_idx="chunk",
+            )
+            self._run_chunkwise_inverse_check_once(
+                processed_actions,
+                chunk_ref_state,
+                action_feature_names,
+                observation_state_feature_names,
+            )
         decoded_actions = decode_chunkwise_actions_to_absolute_actions(
             processed_actions,
             chunk_ref_state=chunk_ref_state,
             action_feature_names=action_feature_names,
             observation_state_feature_names=observation_state_feature_names,
             observation_state_pose_axis_order=self.config.observation_state_pose_axis_order,
+        )
+        self._log_action_tensor_stage(
+            "decoded_absolute_action_chunk",
+            decoded_actions,
+            action_feature_names=action_feature_names,
+            step_idx=debug_step_idx,
+            queue_idx="chunk",
         )
         return decoded_actions
 
@@ -368,6 +458,222 @@ class ACTPolicy(PreTrainedPolicy):
         else:
             logging.info("ACT select_action is returning delta actions in step-wise mode.")
         self._logged_select_action_semantics = True
+
+    def _chunkwise_policy_debug_enabled(self) -> bool:
+        return self._uses_chunkwise_action_alignment() and bool(
+            getattr(self.config, "debug_chunkwise_policy_drift", False)
+        )
+
+    def _should_log_chunkwise_policy_debug(self, step_idx: int) -> bool:
+        if not self._chunkwise_policy_debug_enabled():
+            return False
+        every_n = max(1, int(getattr(self.config, "debug_chunkwise_policy_drift_every_n", 1)))
+        return step_idx % every_n == 0
+
+    def _log_chunkwise_feature_mapping_once(
+        self,
+        action_feature_names: tuple[str, ...],
+        observation_state_feature_names: tuple[str, ...],
+    ) -> None:
+        if self._logged_chunkwise_policy_mapping:
+            return
+        mapping = inspect_chunkwise_feature_mapping(
+            action_feature_names,
+            observation_state_feature_names,
+            self.config.observation_state_pose_axis_order,
+            require_right_arm=True,
+        )
+        logging.info("[POLICY_DRIFT_MAPPING] %s", mapping)
+        self._logged_chunkwise_policy_mapping = True
+
+    def _log_observation_state_pose_stage(
+        self,
+        stage: str,
+        observation_state: Tensor,
+        observation_state_feature_names: tuple[str, ...],
+        *,
+        step_idx: int,
+    ) -> None:
+        if not self._should_log_chunkwise_policy_debug(step_idx):
+            return
+        action_feature_names = self._get_action_feature_names()
+        mapping = inspect_chunkwise_feature_mapping(
+            action_feature_names,
+            observation_state_feature_names,
+            self.config.observation_state_pose_axis_order,
+            require_right_arm=True,
+        )
+        state = observation_state.detach().cpu()
+        if state.ndim == 1:
+            state = state.unsqueeze(0)
+
+        def pose_summary(arm: str) -> dict:
+            arm_map = mapping["arms"].get(arm, {}).get("observation_state", {})
+            return {
+                axis: {
+                    "index": entry["index"],
+                    "feature_name": entry["feature_name"],
+                    "effective_feature_name": entry.get("effective_feature_name"),
+                    "value": round(float(state[0, entry["index"]]), 6),
+                }
+                for axis, entry in arm_map.items()
+                if axis in {"x", "y", "z", "rx", "ry", "rz"}
+            }
+
+        right_z = pose_summary("right").get("z")
+        logging.info(
+            "[POLICY_DRIFT step=%s queue=None stage=%s] right_z=%s | right_pose_canonical=%s | "
+            "left_pose_canonical=%s | canonical_order=%s",
+            step_idx,
+            stage,
+            right_z,
+            pose_summary("right"),
+            pose_summary("left"),
+            mapping["canonical_pose_order"],
+        )
+
+    def _log_action_tensor_stage(
+        self,
+        stage: str,
+        action_tensor: Tensor,
+        *,
+        step_idx: int,
+        queue_idx,
+        action_feature_names: tuple[str, ...] | None = None,
+        extra: dict | None = None,
+    ) -> None:
+        if not self._should_log_chunkwise_policy_debug(step_idx):
+            return
+        action_feature_names = action_feature_names or self._get_action_feature_names()
+        observation_state_feature_names = self._get_observation_state_feature_names()
+        mapping = inspect_chunkwise_feature_mapping(
+            action_feature_names,
+            observation_state_feature_names,
+            self.config.observation_state_pose_axis_order,
+            require_right_arm=True,
+        )
+        tensor = action_tensor.detach().cpu()
+        if tensor.ndim == 1:
+            tensor = tensor.unsqueeze(0)
+
+        right_action_map = mapping["arms"]["right"]["action"]
+        right_z_entry = right_action_map["z"]
+        left_z_entry = mapping["arms"].get("left", {}).get("action", {}).get("z")
+        right_pose = self._action_pose_values(tensor, right_action_map)
+        right_z_values = self._action_axis_trace(tensor, right_z_entry["index"])
+        left_z_values = None if left_z_entry is None else self._action_axis_trace(tensor, left_z_entry["index"])
+        logging.info(
+            "[POLICY_DRIFT step=%s queue=%s stage=%s] right_z_feature=%s idx=%s values=%s | "
+            "left_z=%s | right_pose_step0=%s | extra=%s",
+            step_idx,
+            queue_idx,
+            stage,
+            right_z_entry["feature_name"],
+            right_z_entry["index"],
+            right_z_values,
+            None
+            if left_z_entry is None
+            else {
+                "feature_name": left_z_entry["feature_name"],
+                "index": left_z_entry["index"],
+                "values": left_z_values,
+            },
+            right_pose,
+            extra,
+        )
+
+    @staticmethod
+    def _action_axis_trace(action_tensor: Tensor, index: int, limit: int = 12) -> list[float]:
+        if action_tensor.ndim == 3:
+            values = action_tensor[0, :limit, index]
+        elif action_tensor.ndim == 2:
+            values = action_tensor[:limit, index]
+        else:
+            values = action_tensor[index].reshape(1)
+        return [round(float(value), 6) for value in values.tolist()]
+
+    @staticmethod
+    def _action_pose_values(action_tensor: Tensor, action_axis_map: dict) -> dict:
+        if action_tensor.ndim == 3:
+            step0 = action_tensor[0, 0]
+        elif action_tensor.ndim == 2:
+            step0 = action_tensor[0]
+        else:
+            step0 = action_tensor
+        return {
+            axis: {
+                "index": entry["index"],
+                "feature_name": entry["feature_name"],
+                "value": round(float(step0[entry["index"]]), 6),
+            }
+            for axis, entry in action_axis_map.items()
+            if axis in {"x", "y", "z", "rx", "ry", "rz"}
+        }
+
+    def _run_chunkwise_inverse_check_once(
+        self,
+        processed_actions: Tensor,
+        chunk_ref_state: Tensor,
+        action_feature_names: tuple[str, ...],
+        observation_state_feature_names: tuple[str, ...],
+    ) -> None:
+        if self._logged_chunkwise_inverse_check:
+            return
+        synthetic_stepwise = torch.zeros_like(processed_actions)
+        mapping = inspect_chunkwise_feature_mapping(
+            action_feature_names,
+            observation_state_feature_names,
+            self.config.observation_state_pose_axis_order,
+            require_right_arm=True,
+        )
+        for arm_mapping in mapping["arms"].values():
+            for axis, entry in arm_mapping["action"].items():
+                if axis == "z":
+                    synthetic_stepwise[:, :, entry["index"]] = -0.001
+                elif axis in {"x", "y"}:
+                    synthetic_stepwise[:, :, entry["index"]] = 0.0005
+                elif axis in {"rx", "ry", "rz"}:
+                    synthetic_stepwise[:, :, entry["index"]] = 0.001
+
+        result = check_chunkwise_train_decode_inverse(
+            synthetic_stepwise,
+            chunk_ref_state=chunk_ref_state,
+            action_feature_names=action_feature_names,
+            observation_state_feature_names=observation_state_feature_names,
+            observation_state_pose_axis_order=self.config.observation_state_pose_axis_order,
+        )
+        log_fn = logging.info if result["ok"] else logging.warning
+        log_fn("[POLICY_DRIFT_INVERSE_CHECK] %s", result)
+        self._logged_chunkwise_inverse_check = True
+
+    def _log_temporal_ensemble_history(self, step_idx: int) -> None:
+        if not self._should_log_chunkwise_policy_debug(step_idx):
+            return
+        history = getattr(self.temporal_ensembler, "last_debug_selected_history", None)
+        if not history:
+            return
+        action_feature_names = self._get_action_feature_names()
+        observation_state_feature_names = self._get_observation_state_feature_names()
+        mapping = inspect_chunkwise_feature_mapping(
+            action_feature_names,
+            observation_state_feature_names,
+            self.config.observation_state_pose_axis_order,
+            require_right_arm=True,
+        )
+        right_z_index = mapping["arms"]["right"]["action"]["z"]["index"]
+        history_summary = [
+            {
+                "origin_step_idx": item["origin_step_idx"],
+                "origin_queue_idx": item["origin_queue_idx"],
+                "right_z": round(float(item["action"][0, right_z_index].detach().cpu()), 6),
+            }
+            for item in history
+        ]
+        logging.info(
+            "[POLICY_DRIFT step=%s queue=0 stage=temporal_ensemble_history] right_z_history=%s",
+            step_idx,
+            history_summary,
+        )
 
 class ACTTemporalEnsembler:
     def __init__(self, temporal_ensemble_coeff: float, chunk_size: int) -> None:
@@ -422,8 +728,10 @@ class ACTTemporalEnsembler:
         self.ensembled_actions = None
         # (chunk_size,) count of how many actions are in the ensemble for each time step in the sequence.
         self.ensembled_actions_count = None
+        self.debug_action_histories = None
+        self.last_debug_selected_history = None
 
-    def update(self, actions: Tensor) -> Tensor:
+    def update(self, actions: Tensor, debug_step_idx: int | None = None) -> Tensor:
         """
         Takes a (batch, chunk_size, action_dim) sequence of actions, update the temporal ensemble for all
         time steps, and pop/return the next batch of actions in the sequence.
@@ -439,6 +747,17 @@ class ACTTemporalEnsembler:
             self.ensembled_actions_count = torch.ones(
                 (self.chunk_size, 1), dtype=torch.long, device=self.ensembled_actions.device
             )
+            if debug_step_idx is not None:
+                self.debug_action_histories = [
+                    [
+                        {
+                            "origin_step_idx": debug_step_idx,
+                            "origin_queue_idx": queue_idx,
+                            "action": actions[:, queue_idx].detach().clone(),
+                        }
+                    ]
+                    for queue_idx in range(actions.shape[1])
+                ]
         else:
             # self.ensembled_actions will have shape (batch_size, chunk_size - 1, action_dim). Compute
             # the online update for those entries.
@@ -451,7 +770,36 @@ class ACTTemporalEnsembler:
             self.ensembled_actions_count = torch.cat(
                 [self.ensembled_actions_count, torch.ones_like(self.ensembled_actions_count[-1:])]
             )
+            if debug_step_idx is not None:
+                if self.debug_action_histories is None:
+                    self.debug_action_histories = [[] for _ in range(actions.shape[1] - 1)]
+                updated_histories = [
+                    [
+                        *history,
+                        {
+                            "origin_step_idx": debug_step_idx,
+                            "origin_queue_idx": queue_idx,
+                            "action": actions[:, queue_idx].detach().clone(),
+                        },
+                    ]
+                    for queue_idx, history in enumerate(self.debug_action_histories)
+                ]
+                updated_histories.append(
+                    [
+                        {
+                            "origin_step_idx": debug_step_idx,
+                            "origin_queue_idx": actions.shape[1] - 1,
+                            "action": actions[:, -1].detach().clone(),
+                        }
+                    ]
+                )
+                self.debug_action_histories = updated_histories
         # "Consume" the first action.
+        if debug_step_idx is not None and self.debug_action_histories is not None:
+            self.last_debug_selected_history = self.debug_action_histories[0]
+            self.debug_action_histories = self.debug_action_histories[1:]
+        else:
+            self.last_debug_selected_history = None
         action, self.ensembled_actions, self.ensembled_actions_count = (
             self.ensembled_actions[:, 0],
             self.ensembled_actions[:, 1:],
