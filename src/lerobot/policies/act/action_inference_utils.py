@@ -117,6 +117,57 @@ def decode_chunkwise_actions_to_absolute_actions(
     return decoded
 
 
+def summarize_action_chunk_step(
+    actions: Tensor,
+    action_feature_names: tuple[str, ...],
+    *,
+    step: int = 0,
+    batch_index: int = 0,
+) -> dict[str, dict[str, list[float]]]:
+    if actions.ndim != 3:
+        raise ValueError(f"`actions` must have shape [B, chunk_size, action_dim]. Got {tuple(actions.shape)}.")
+    if actions.shape[-1] != len(action_feature_names):
+        raise ValueError(
+            "The number of `action_feature_names` must match the action dimension. "
+            f"Got {len(action_feature_names)} names for action_dim={actions.shape[-1]}."
+        )
+    if not 0 <= batch_index < actions.shape[0]:
+        raise ValueError(f"`batch_index` must be in [0, {actions.shape[0]}). Got {batch_index}.")
+    if not 0 <= step < actions.shape[1]:
+        raise ValueError(f"`step` must be in [0, {actions.shape[1]}). Got {step}.")
+
+    layouts = _build_pose_field_layouts(action_feature_names)
+    return _summarize_pose_vector(actions[batch_index, step], layouts)
+
+
+def summarize_observation_state_pose(
+    chunk_ref_state: Tensor,
+    observation_state_feature_names: tuple[str, ...],
+    observation_state_pose_axis_order: tuple[str, ...] = ("x", "y", "z", "rx", "ry", "rz"),
+    *,
+    batch_index: int = 0,
+) -> dict[str, dict[str, list[float]]]:
+    if chunk_ref_state.ndim != 2:
+        raise ValueError(
+            "`chunk_ref_state` must have shape [B, state_dim]. "
+            f"Got {tuple(chunk_ref_state.shape)}."
+        )
+    if chunk_ref_state.shape[-1] != len(observation_state_feature_names):
+        raise ValueError(
+            "The number of `observation_state_feature_names` must match the state dimension. "
+            f"Got {len(observation_state_feature_names)} names for state_dim={chunk_ref_state.shape[-1]}."
+        )
+    if not 0 <= batch_index < chunk_ref_state.shape[0]:
+        raise ValueError(f"`batch_index` must be in [0, {chunk_ref_state.shape[0]}). Got {batch_index}.")
+
+    effective_observation_state_feature_names = _remap_observation_state_feature_names(
+        observation_state_feature_names,
+        observation_state_pose_axis_order,
+    )
+    layouts = _build_pose_field_layouts(effective_observation_state_feature_names)
+    return _summarize_pose_vector(chunk_ref_state[batch_index], layouts)
+
+
 def _remap_observation_state_feature_names(
     observation_state_feature_names: tuple[str, ...],
     observation_state_pose_axis_order: tuple[str, ...],
@@ -192,6 +243,27 @@ def _extract_chunk_reference_poses(
         )
 
     return reference_poses
+
+
+def _summarize_pose_vector(
+    pose_vector: Tensor,
+    layouts: list[_PoseFieldLayout],
+) -> dict[str, dict[str, list[float]]]:
+    summary: dict[str, dict[str, list[float]]] = {}
+    for layout in layouts:
+        arm_summary: dict[str, list[float]] = {}
+        if layout.translation_indices is not None:
+            arm_summary["xyz"] = _round_tensor_values(pose_vector[list(layout.translation_indices)])
+        if layout.rotation_indices is not None and layout.rotation_representation is not None:
+            rotation_key = "rpy" if layout.rotation_representation == "euler_xyz" else "rotvec"
+            arm_summary[rotation_key] = _round_tensor_values(pose_vector[list(layout.rotation_indices)])
+        if arm_summary:
+            summary[layout.arm_name] = arm_summary
+    return summary
+
+
+def _round_tensor_values(values: Tensor) -> list[float]:
+    return [round(float(value), 4) for value in values.detach().cpu().tolist()]
 
 
 def _decode_absolute_rotations(

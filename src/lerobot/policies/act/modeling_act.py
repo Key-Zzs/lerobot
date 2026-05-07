@@ -35,7 +35,11 @@ from torchvision.models._utils import IntermediateLayerGetter
 from torchvision.ops.misc import FrozenBatchNorm2d
 
 from lerobot.policies.act.action_delta_utils import convert_stepwise_to_chunkwise_actions
-from lerobot.policies.act.action_inference_utils import decode_chunkwise_actions_to_absolute_actions
+from lerobot.policies.act.action_inference_utils import (
+    decode_chunkwise_actions_to_absolute_actions,
+    summarize_action_chunk_step,
+    summarize_observation_state_pose,
+)
 from lerobot.policies.act.configuration_act import ACTConfig
 from lerobot.policies.pretrained import PreTrainedPolicy
 from lerobot.utils.constants import ACTION, OBS_ENV_STATE, OBS_IMAGES, OBS_STATE
@@ -72,6 +76,7 @@ class ACTPolicy(PreTrainedPolicy):
         self._logged_chunk_ref_pose = False
         self._logged_temporal_ensemble_space = False
         self._logged_select_action_semantics = False
+        self._chunkwise_debug_logs_remaining = 3
         self.reset()
 
     def get_optim_params(self) -> dict:
@@ -312,6 +317,10 @@ class ACTPolicy(PreTrainedPolicy):
 
         if not self._logged_chunk_ref_pose:
             logging.info("ACT chunk-wise inference is using `observation.state` as the chunk reference pose source.")
+            logging.info(
+                "ACT chunk-wise inference observation_state_pose_axis_order=%s",
+                self.config.observation_state_pose_axis_order,
+            )
             self._logged_chunk_ref_pose = True
 
         # Decode after postprocessing so chunk-wise composition happens in the same physical pose space that
@@ -322,13 +331,21 @@ class ACTPolicy(PreTrainedPolicy):
             device=processed_actions.device,
             dtype=processed_actions.dtype,
         )
-        return decode_chunkwise_actions_to_absolute_actions(
+        decoded_actions = decode_chunkwise_actions_to_absolute_actions(
             processed_actions,
             chunk_ref_state=chunk_ref_state,
             action_feature_names=action_feature_names,
             observation_state_feature_names=observation_state_feature_names,
             observation_state_pose_axis_order=self.config.observation_state_pose_axis_order,
         )
+        self._log_chunkwise_debug_snapshot(
+            chunk_ref_state=chunk_ref_state,
+            processed_actions=processed_actions,
+            decoded_actions=decoded_actions,
+            action_feature_names=action_feature_names,
+            observation_state_feature_names=observation_state_feature_names,
+        )
+        return decoded_actions
 
     def _postprocess_action_chunk(
         self, actions: Tensor, postprocessor: Callable[[Tensor], Tensor]
@@ -361,6 +378,56 @@ class ACTPolicy(PreTrainedPolicy):
         else:
             logging.info("ACT select_action is returning delta actions in step-wise mode.")
         self._logged_select_action_semantics = True
+
+    def _log_chunkwise_debug_snapshot(
+        self,
+        chunk_ref_state: Tensor,
+        processed_actions: Tensor,
+        decoded_actions: Tensor,
+        action_feature_names: tuple[str, ...],
+        observation_state_feature_names: tuple[str, ...],
+    ) -> None:
+        if self._chunkwise_debug_logs_remaining <= 0:
+            return
+
+        snapshot_index = 4 - self._chunkwise_debug_logs_remaining
+        ref_pose_summary = summarize_observation_state_pose(
+            chunk_ref_state,
+            observation_state_feature_names,
+            self.config.observation_state_pose_axis_order,
+            batch_index=0,
+        )
+        processed_delta_summary = summarize_action_chunk_step(
+            processed_actions,
+            action_feature_names,
+            step=0,
+            batch_index=0,
+        )
+        decoded_absolute_summary = summarize_action_chunk_step(
+            decoded_actions,
+            action_feature_names,
+            step=0,
+            batch_index=0,
+        )
+        # Low-frequency deployment debug to help diagnose whether chunk-wise decode is producing sensible
+        # absolute targets. This intentionally logs only the first few predictions so robot runs are not
+        # flooded with per-step messages.
+        logging.info(
+            "ACT chunk-wise debug [%d/3] ref_pose(batch0)=%s",
+            snapshot_index,
+            ref_pose_summary,
+        )
+        logging.info(
+            "ACT chunk-wise debug [%d/3] processed_delta(step0,batch0)=%s",
+            snapshot_index,
+            processed_delta_summary,
+        )
+        logging.info(
+            "ACT chunk-wise debug [%d/3] decoded_absolute(step0,batch0)=%s",
+            snapshot_index,
+            decoded_absolute_summary,
+        )
+        self._chunkwise_debug_logs_remaining -= 1
 
 
 class ACTTemporalEnsembler:
