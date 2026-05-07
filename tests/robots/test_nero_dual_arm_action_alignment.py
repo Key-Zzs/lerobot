@@ -39,15 +39,7 @@ class _ServoRecorder:
         self.left_pose = None if left_pose is None else np.asarray(left_pose, dtype=float)
         self.right_pose = None if right_pose is None else np.asarray(right_pose, dtype=float)
 
-    def servo_p_OL(
-        self,
-        robot_arm: str,
-        pose,
-        delta: bool,
-        debug_target_abs_pose=None,
-        debug_step_idx=None,
-        debug_queue_idx=None,
-    ) -> bool:
+    def servo_p_OL(self, robot_arm: str, pose, delta: bool) -> bool:
         self.calls.append((robot_arm, np.asarray(pose, dtype=float), delta))
         return True
 
@@ -162,7 +154,7 @@ def test_send_action_cartesian_chunkwise_defaults_to_servo_ol_reference_not_obse
     np.testing.assert_allclose(robot._robot.calls[1][1][:3], [1.0, 2.0, 3.0])
 
 
-def test_send_action_cartesian_chunkwise_can_use_observation_reference_as_explicit_debug_path():
+def test_send_action_cartesian_chunkwise_can_use_observation_reference_when_configured():
     robot = _make_robot("chunk_wise", chunkwise_reference_pose_source="observation")
     _set_prev_observation(
         robot,
