@@ -46,6 +46,7 @@ def decode_chunkwise_actions_to_absolute_actions(
     chunk_ref_state: Tensor,
     action_feature_names: tuple[str, ...],
     observation_state_feature_names: tuple[str, ...],
+    observation_state_pose_axis_order: tuple[str, ...] = ("x", "y", "z", "rx", "ry", "rz"),
 ) -> Tensor:
     """Decode chunk-wise ACT outputs into absolute target actions.
 
@@ -78,8 +79,12 @@ def decode_chunkwise_actions_to_absolute_actions(
         )
 
     action_layouts = _build_pose_field_layouts(action_feature_names)
+    effective_observation_state_feature_names = _remap_observation_state_feature_names(
+        observation_state_feature_names,
+        observation_state_pose_axis_order,
+    )
     reference_layouts = {
-        layout.arm_name: layout for layout in _build_pose_field_layouts(observation_state_feature_names)
+        layout.arm_name: layout for layout in _build_pose_field_layouts(effective_observation_state_feature_names)
     }
     # The action chunk and the reference pose are parsed independently from feature names so we can fail
     # loudly if training-time action channels and inference-time state channels stop matching. This avoids
@@ -110,6 +115,36 @@ def decode_chunkwise_actions_to_absolute_actions(
             ).to(dtype=actions.dtype)
 
     return decoded
+
+
+def _remap_observation_state_feature_names(
+    observation_state_feature_names: tuple[str, ...],
+    observation_state_pose_axis_order: tuple[str, ...],
+) -> tuple[str, ...]:
+    canonical_pose_axes = ("x", "y", "z", "rx", "ry", "rz")
+    if tuple(observation_state_pose_axis_order) == canonical_pose_axes:
+        return observation_state_feature_names
+    if len(observation_state_pose_axis_order) != len(canonical_pose_axes):
+        raise ValueError(
+            "`observation_state_pose_axis_order` must describe 6 ee-pose axes. "
+            f"Got {observation_state_pose_axis_order}."
+        )
+
+    stored_axis_to_semantic_axis = {
+        stored_axis: semantic_axis
+        for semantic_axis, stored_axis in zip(canonical_pose_axes, observation_state_pose_axis_order, strict=True)
+    }
+    remapped_names: list[str] = []
+    for feature_name in observation_state_feature_names:
+        for stored_axis, semantic_axis in stored_axis_to_semantic_axis.items():
+            suffix = f".{stored_axis}"
+            if feature_name.endswith(suffix):
+                remapped_names.append(feature_name[: -len(suffix)] + f".{semantic_axis}")
+                break
+        else:
+            remapped_names.append(feature_name)
+
+    return tuple(remapped_names)
 
 
 def _extract_chunk_reference_poses(

@@ -175,6 +175,41 @@ def test_chunkwise_predict_action_chunk_decodes_absolute_targets():
     torch.testing.assert_close(action_chunk, expected)
 
 
+def test_chunkwise_predict_action_chunk_respects_observation_state_pose_axis_order():
+    policy = _make_policy(action_delta_alignment="chunk_wise", chunk_size=1)
+    policy.config.observation_state_pose_axis_order = ("x", "y", "z", "rz", "ry", "rx")
+    policy.model = DummyChunkModel(
+        [
+            torch.tensor(
+                [
+                    [
+                        [1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.1],
+                    ]
+                ]
+            )
+        ]
+    )
+
+    # Stored state layout is still [x, y, z, rx, ry, rz], but the actual TCP feedback values follow the
+    # legacy Nero compatibility order [x, y, z, rz, ry, rx].
+    action_chunk = policy.predict_action_chunk(
+        _batch(),
+        raw_observation={
+            OBS_STATE: torch.tensor([[10.0, 0.0, 0.0, 0.3, 0.2, 0.1]], dtype=torch.float32),
+        },
+        postprocessor=lambda action: action,
+    )
+
+    expected = torch.tensor(
+        [
+            [
+                [11.0, 0.0, 0.0, 0.1, 0.2, 0.3, 0.1],
+            ]
+        ]
+    )
+    torch.testing.assert_close(action_chunk, expected, atol=1e-5, rtol=1e-5)
+
+
 def test_chunkwise_select_action_returns_absolute_targets():
     policy = _make_policy(action_delta_alignment="chunk_wise", chunk_size=1)
     policy.model = DummyChunkModel(

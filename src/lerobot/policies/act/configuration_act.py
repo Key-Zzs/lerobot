@@ -141,6 +141,11 @@ class ACTConfig(PreTrainedConfig):
     # Flattened `observation.state` feature names. Used only during chunk-wise inference so ACT can recover
     # the current absolute end-effector pose and decode model outputs into absolute target actions.
     observation_state_feature_names: tuple[str, ...] = ()
+    # Semantic axis order of the absolute ee pose values stored inside `observation.state`.
+    # Most robots use the canonical order ("x", "y", "z", "rx", "ry", "rz"). Some legacy datasets keep the
+    # same feature names but store TCP feedback under a compatibility order such as ("x", "y", "z", "rz",
+    # "ry", "rx"). Chunk-wise inference uses this hint only when recovering the chunk reference pose.
+    observation_state_pose_axis_order: tuple[str, ...] = ("x", "y", "z", "rx", "ry", "rz")
 
     # Training preset
     optimizer_lr: float = 1e-5

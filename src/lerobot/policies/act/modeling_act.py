@@ -327,6 +327,7 @@ class ACTPolicy(PreTrainedPolicy):
             chunk_ref_state=chunk_ref_state,
             action_feature_names=action_feature_names,
             observation_state_feature_names=observation_state_feature_names,
+            observation_state_pose_axis_order=self.config.observation_state_pose_axis_order,
         )
 
     def _postprocess_action_chunk(
