@@ -363,6 +363,13 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
         raw_policy_observation = {
             key: value.clone() if isinstance(value, torch.Tensor) else value for key, value in observation.items()
         }
+        if self._uses_act_chunkwise_inference() and getattr(
+            self.policy.config,
+            "debug_chunkwise_replan_consistency",
+            False,
+        ):
+            raw_policy_observation["_debug_observation_timestamp"] = observation_t.get_timestamp()
+            raw_policy_observation["_debug_step_idx"] = observation_t.get_timestep()
         prepare_time = time.perf_counter() - start_prepare
 
         """2. Apply preprocessor"""

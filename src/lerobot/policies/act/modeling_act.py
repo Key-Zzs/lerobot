@@ -19,8 +19,10 @@ As per Learning Fine-Grained Bimanual Manipulation with Low-Cost Hardware (https
 The majority of changes here involve removing unused code, unifying naming, and adding helpful comments.
 """
 
+import json
 import logging
 import math
+import time
 from collections import deque
 from collections.abc import Callable
 from itertools import chain
@@ -40,6 +42,7 @@ from lerobot.policies.act.action_delta_utils import (
 )
 from lerobot.policies.act.action_inference_utils import (
     decode_chunkwise_actions_to_absolute_actions,
+    inspect_chunkwise_feature_mapping,
 )
 from lerobot.policies.act.configuration_act import ACTConfig
 from lerobot.policies.pretrained import PreTrainedPolicy
@@ -77,6 +80,8 @@ class ACTPolicy(PreTrainedPolicy):
         self._logged_chunk_ref_pose = False
         self._logged_temporal_ensemble_space = False
         self._logged_select_action_semantics = False
+        self._last_chunkwise_replan_debug = None
+        self._debug_chunkwise_replan_call_count = 0
         self.reset()
 
     def get_optim_params(self) -> dict:
@@ -106,6 +111,8 @@ class ACTPolicy(PreTrainedPolicy):
             self.temporal_ensembler.reset()
         else:
             self._action_queue = deque([], maxlen=self.config.n_action_steps)
+        self._last_chunkwise_replan_debug = None
+        self._debug_chunkwise_replan_call_count = 0
 
     @torch.no_grad()
     def select_action(
@@ -337,6 +344,13 @@ class ACTPolicy(PreTrainedPolicy):
             observation_state_feature_names=observation_state_feature_names,
             observation_state_pose_axis_order=self.config.observation_state_pose_axis_order,
         )
+        self._log_chunkwise_replan_consistency_debug(
+            decoded_actions=decoded_actions,
+            chunk_ref_state=chunk_ref_state,
+            action_feature_names=action_feature_names,
+            observation_state_feature_names=observation_state_feature_names,
+            raw_observation=raw_observation,
+        )
         return decoded_actions
 
     def _postprocess_action_chunk(
@@ -370,6 +384,180 @@ class ACTPolicy(PreTrainedPolicy):
         else:
             logging.info("ACT select_action is returning delta actions in step-wise mode.")
         self._logged_select_action_semantics = True
+
+    def _log_chunkwise_replan_consistency_debug(
+        self,
+        *,
+        decoded_actions: Tensor,
+        chunk_ref_state: Tensor,
+        action_feature_names: tuple[str, ...],
+        observation_state_feature_names: tuple[str, ...],
+        raw_observation: dict[str, Tensor],
+    ) -> None:
+        if not self.config.debug_chunkwise_replan_consistency:
+            return
+
+        mapping = inspect_chunkwise_feature_mapping(
+            action_feature_names,
+            observation_state_feature_names,
+            self.config.observation_state_pose_axis_order,
+        )
+        logged_steps = min(3, decoded_actions.shape[1])
+        action_sample = decoded_actions.detach().cpu()[0, :logged_steps]
+        ref_sample = chunk_ref_state.detach().cpu()[0]
+
+        chunk_ref_pose = {}
+        current_actions = {}
+        for arm_name, arm_mapping in mapping["arms"].items():
+            observation_pose_indices = self._debug_pose_indices(arm_mapping["observation_state"])
+            action_pose_indices = self._debug_pose_indices(arm_mapping["action"])
+            if observation_pose_indices is not None:
+                chunk_ref_pose[arm_name] = self._debug_float_list(ref_sample[observation_pose_indices])
+            if action_pose_indices is not None:
+                current_actions[arm_name] = {
+                    f"step{step}": self._debug_float_list(action_sample[step, action_pose_indices])
+                    for step in range(logged_steps)
+                }
+
+        gripper_actions = self._extract_debug_gripper_actions(
+            action_sample,
+            action_feature_names,
+            logged_steps,
+        )
+        previous_actions = None
+        if self._last_chunkwise_replan_debug is not None:
+            previous_actions = self._last_chunkwise_replan_debug.get("actions")
+
+        step0_delta = self._build_debug_step0_delta(current_actions, previous_actions)
+        right_arm = self._build_debug_right_arm_summary(current_actions, gripper_actions)
+        observation_timestamp = raw_observation.get("_debug_observation_timestamp")
+        if observation_timestamp is None:
+            observation_timestamp = time.time()
+        step_idx = raw_observation.get("_debug_step_idx")
+        if step_idx is None:
+            step_idx = self._debug_chunkwise_replan_call_count
+        payload = {
+            "type": "chunkwise_replan_consistency",
+            "observation_timestamp": self._debug_scalar(observation_timestamp),
+            "step_idx": self._debug_int(step_idx),
+            "batch_size": int(decoded_actions.shape[0]),
+            "chunk_size": int(decoded_actions.shape[1]),
+            "logged_steps": int(logged_steps),
+            "chunk_ref_pose": chunk_ref_pose,
+            "current_actions": current_actions,
+            "previous_actions": previous_actions,
+            "step0_delta": step0_delta,
+            "right_arm": right_arm,
+            "gripper_actions": gripper_actions,
+        }
+        logging.info("[CHUNKWISE_REPLAN_DEBUG] %s", json.dumps(payload, sort_keys=True))
+        self._last_chunkwise_replan_debug = {
+            "actions": current_actions,
+            "gripper_actions": gripper_actions,
+        }
+        self._debug_chunkwise_replan_call_count += 1
+
+    @staticmethod
+    def _debug_pose_indices(axis_mapping: dict[str, dict]) -> list[int] | None:
+        axes = ("x", "y", "z", "rx", "ry", "rz")
+        if not all(axis in axis_mapping for axis in axes):
+            return None
+        return [int(axis_mapping[axis]["index"]) for axis in axes]
+
+    @staticmethod
+    def _debug_float_list(values: Tensor | np.ndarray | list[float]) -> list[float]:
+        if isinstance(values, Tensor):
+            values = values.detach().cpu().reshape(-1).tolist()
+        return [round(float(value), 8) for value in values]
+
+    @staticmethod
+    def _debug_scalar(value: object) -> float | None:
+        if value is None:
+            return None
+        if isinstance(value, Tensor):
+            return float(value.detach().cpu().reshape(-1)[0].item())
+        return float(value)
+
+    @staticmethod
+    def _debug_int(value: object) -> int | None:
+        if value is None:
+            return None
+        if isinstance(value, Tensor):
+            return int(value.detach().cpu().reshape(-1)[0].item())
+        return int(value)
+
+    @staticmethod
+    def _wrap_debug_rpy_delta(delta: np.ndarray) -> np.ndarray:
+        wrapped = np.asarray(delta, dtype=float).copy()
+        wrapped[3:] = (wrapped[3:] + np.pi) % (2.0 * np.pi) - np.pi
+        return wrapped
+
+    @classmethod
+    def _build_debug_step0_delta(
+        cls,
+        current_actions: dict[str, dict[str, list[float]]],
+        previous_actions: dict[str, dict[str, list[float]]] | None,
+    ) -> dict[str, dict]:
+        if previous_actions is None:
+            return {}
+
+        step0_delta = {}
+        for arm_name, arm_actions in current_actions.items():
+            if arm_name not in previous_actions or "step0" not in arm_actions:
+                continue
+            prev_step0 = previous_actions[arm_name].get("step0")
+            if prev_step0 is None:
+                continue
+            delta = cls._wrap_debug_rpy_delta(
+                np.asarray(arm_actions["step0"], dtype=float) - np.asarray(prev_step0, dtype=float)
+            )
+            step0_delta[arm_name] = {
+                "step0_abs_delta": cls._debug_float_list(delta.tolist()),
+                "step0_xyz_norm": float(np.linalg.norm(delta[:3])),
+                "step0_rpy_norm": float(np.linalg.norm(delta[3:])),
+            }
+        return step0_delta
+
+    @staticmethod
+    def _extract_debug_gripper_actions(
+        action_sample: Tensor,
+        action_feature_names: tuple[str, ...],
+        logged_steps: int,
+    ) -> dict[str, list[float]]:
+        gripper_actions = {}
+        for index, feature_name in enumerate(action_feature_names):
+            if "gripper" not in feature_name.lower():
+                continue
+            gripper_actions[feature_name] = [
+                round(float(action_sample[step, index].item()), 8) for step in range(logged_steps)
+            ]
+        return gripper_actions
+
+    @staticmethod
+    def _build_debug_right_arm_summary(
+        current_actions: dict[str, dict[str, list[float]]],
+        gripper_actions: dict[str, list[float]],
+    ) -> dict:
+        right_steps = current_actions.get("right")
+        if right_steps is None:
+            return {}
+
+        summary = {"steps": right_steps}
+        for step_name, pose in right_steps.items():
+            summary[step_name] = {
+                "z": pose[2],
+                "rx": pose[3],
+                "ry": pose[4],
+                "rz": pose[5],
+            }
+        right_grippers = {
+            feature_name: values
+            for feature_name, values in gripper_actions.items()
+            if feature_name.lower().startswith("right")
+        }
+        if right_grippers:
+            summary["gripper_actions"] = right_grippers
+        return summary
 
 class ACTTemporalEnsembler:
     def __init__(self, temporal_ensemble_coeff: float, chunk_size: int) -> None:

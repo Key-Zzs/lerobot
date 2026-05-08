@@ -146,6 +146,9 @@ class ACTConfig(PreTrainedConfig):
     # same feature names but store TCP feedback under a compatibility order such as ("x", "y", "z", "rz",
     # "ry", "rx"). Chunk-wise inference uses this hint only when recovering the chunk reference pose.
     observation_state_pose_axis_order: tuple[str, ...] = ("x", "y", "z", "rx", "ry", "rz")
+    # Default-off diagnostic logging for chunk-wise deployment. When enabled, ACT logs the chunk reference
+    # pose, the first few decoded absolute actions, and step0 changes across consecutive replans.
+    debug_chunkwise_replan_consistency: bool = True
 
     # Training preset
     optimizer_lr: float = 1e-5
