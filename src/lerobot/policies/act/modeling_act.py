@@ -34,7 +34,10 @@ from torch import Tensor, nn
 from torchvision.models._utils import IntermediateLayerGetter
 from torchvision.ops.misc import FrozenBatchNorm2d
 
-from lerobot.policies.act.action_delta_utils import convert_stepwise_to_chunkwise_actions
+from lerobot.policies.act.action_delta_utils import (
+    ACT_CHUNKWISE_LABELS_CONVERTED_KEY,
+    convert_stepwise_to_chunkwise_actions,
+)
 from lerobot.policies.act.action_inference_utils import (
     decode_chunkwise_actions_to_absolute_actions,
 )
@@ -191,10 +194,8 @@ class ACTPolicy(PreTrainedPolicy):
 
     def forward(self, batch: dict[str, Tensor]) -> tuple[Tensor, dict]:
         """Run the batch through the model and compute the loss for training or validation."""
-        # Training-only hook:
-        # - `step_wise` keeps labels exactly as stored in the dataset.
-        # - `chunk_wise` rewrites only `batch["action"]` before loss computation.
-        # Inference paths (`select_action`, temporal ensembling, execution) never call this helper.
+        # Chunk-wise training labels are normally converted in the ACT preprocessor before action
+        # normalization. This helper is a fallback for tests or custom callers that bypass that preprocessor.
         batch = self._prepare_training_batch(batch)
         if self.config.image_features:
             batch = dict(batch)  # shallow copy so that adding a key doesn't modify the original
@@ -228,11 +229,12 @@ class ACTPolicy(PreTrainedPolicy):
 
         if ACTION not in batch:
             raise ValueError("`batch['action']` is required when `action_delta_alignment='chunk_wise'`.")
+        if batch.get(ACT_CHUNKWISE_LABELS_CONVERTED_KEY, False):
+            return batch
 
         action_feature_names = self._get_action_feature_names()
         converted_batch = dict(batch)
-        # Only the supervision target is converted. `action_is_pad` and the observation tensors are reused
-        # unchanged so the existing masking and model inputs keep their original behavior.
+        converted_batch[ACT_CHUNKWISE_LABELS_CONVERTED_KEY] = True
         converted_batch[ACTION] = convert_stepwise_to_chunkwise_actions(batch[ACTION], action_feature_names)
         return converted_batch
 

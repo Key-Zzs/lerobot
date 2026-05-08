@@ -22,6 +22,9 @@ import torch
 from torch import Tensor
 
 
+ACT_CHUNKWISE_LABELS_CONVERTED_KEY = "_act_chunkwise_action_labels_converted"
+
+
 @dataclass(frozen=True)
 class _PoseFieldLayout:
     arm_name: str

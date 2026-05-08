@@ -199,26 +199,32 @@ def make_pre_post_processors(
             policy configuration type.
     """
     if pretrained_path:
-        return (
-            PolicyProcessorPipeline.from_pretrained(
-                pretrained_model_name_or_path=pretrained_path,
-                config_filename=kwargs.get(
-                    "preprocessor_config_filename", f"{POLICY_PREPROCESSOR_DEFAULT_NAME}.json"
-                ),
-                overrides=kwargs.get("preprocessor_overrides", {}),
-                to_transition=batch_to_transition,
-                to_output=transition_to_batch,
+        if isinstance(policy_cfg, ACTConfig):
+            # Register the ACT-specific processor step before loading processor configs saved by chunk-wise
+            # checkpoints.
+            from lerobot.policies.act.processor_act import ACTChunkwiseActionLabelProcessorStep  # noqa: F401
+
+        preprocessor = PolicyProcessorPipeline.from_pretrained(
+            pretrained_model_name_or_path=pretrained_path,
+            config_filename=kwargs.get(
+                "preprocessor_config_filename", f"{POLICY_PREPROCESSOR_DEFAULT_NAME}.json"
             ),
-            PolicyProcessorPipeline.from_pretrained(
-                pretrained_model_name_or_path=pretrained_path,
-                config_filename=kwargs.get(
-                    "postprocessor_config_filename", f"{POLICY_POSTPROCESSOR_DEFAULT_NAME}.json"
-                ),
-                overrides=kwargs.get("postprocessor_overrides", {}),
-                to_transition=policy_action_to_transition,
-                to_output=transition_to_policy_action,
-            ),
+            overrides=kwargs.get("preprocessor_overrides", {}),
+            to_transition=batch_to_transition,
+            to_output=transition_to_batch,
         )
+        postprocessor = PolicyProcessorPipeline.from_pretrained(
+            pretrained_model_name_or_path=pretrained_path,
+            config_filename=kwargs.get(
+                "postprocessor_config_filename", f"{POLICY_POSTPROCESSOR_DEFAULT_NAME}.json"
+            ),
+            overrides=kwargs.get("postprocessor_overrides", {}),
+            to_transition=policy_action_to_transition,
+            to_output=transition_to_policy_action,
+        )
+        if isinstance(policy_cfg, ACTConfig):
+            preprocessor = _ensure_act_chunkwise_action_label_processor(preprocessor, policy_cfg)
+        return preprocessor, postprocessor
 
     # Create a new processor based on policy type
     if isinstance(policy_cfg, TDMPCConfig):
@@ -297,6 +303,39 @@ def make_pre_post_processors(
         raise NotImplementedError(f"Processor for policy type '{policy_cfg.type}' is not implemented.")
 
     return processors
+
+
+def _ensure_act_chunkwise_action_label_processor(
+    preprocessor: PolicyProcessorPipeline,
+    policy_cfg: ACTConfig,
+) -> PolicyProcessorPipeline:
+    if policy_cfg.action_delta_alignment != "chunk_wise":
+        return preprocessor
+
+    from lerobot.policies.act.processor_act import ACTChunkwiseActionLabelProcessorStep
+
+    steps = list(preprocessor.steps)
+    for step in steps:
+        if isinstance(step, ACTChunkwiseActionLabelProcessorStep):
+            step.action_delta_alignment = policy_cfg.action_delta_alignment
+            step.action_feature_names = policy_cfg.action_feature_names
+            return preprocessor
+
+    converter = ACTChunkwiseActionLabelProcessorStep(
+        action_delta_alignment=policy_cfg.action_delta_alignment,
+        action_feature_names=policy_cfg.action_feature_names,
+    )
+    insert_index = next(
+        (
+            index
+            for index, step in enumerate(steps)
+            if getattr(step, "_registry_name", None) == "normalizer_processor"
+        ),
+        len(steps),
+    )
+    steps.insert(insert_index, converter)
+    preprocessor.steps = steps
+    return preprocessor
 
 
 def make_policy(

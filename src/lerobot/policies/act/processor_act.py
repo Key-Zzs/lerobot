@@ -13,10 +13,16 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+from dataclasses import dataclass
 from typing import Any
 
 import torch
 
+from lerobot.configs.types import PipelineFeatureType, PolicyFeature
+from lerobot.policies.act.action_delta_utils import (
+    ACT_CHUNKWISE_LABELS_CONVERTED_KEY,
+    convert_stepwise_to_chunkwise_actions,
+)
 from lerobot.policies.act.configuration_act import ACTConfig
 from lerobot.processor import (
     AddBatchDimensionProcessorStep,
@@ -24,11 +30,59 @@ from lerobot.processor import (
     NormalizerProcessorStep,
     PolicyAction,
     PolicyProcessorPipeline,
+    ProcessorStep,
+    ProcessorStepRegistry,
     RenameObservationsProcessorStep,
+    TransitionKey,
     UnnormalizerProcessorStep,
 )
 from lerobot.processor.converters import policy_action_to_transition, transition_to_policy_action
 from lerobot.utils.constants import POLICY_POSTPROCESSOR_DEFAULT_NAME, POLICY_PREPROCESSOR_DEFAULT_NAME
+
+
+@dataclass
+@ProcessorStepRegistry.register(name="act_chunkwise_action_label_processor")
+class ACTChunkwiseActionLabelProcessorStep(ProcessorStep):
+    """Convert ACT chunk-wise training labels before action normalization.
+
+    Dataset actions are stored as executable step-wise deltas. For chunk-wise ACT supervision we first convert
+    those raw physical deltas into offsets from the chunk start, then the shared normalizer scales the converted
+    labels. Running the conversion after normalization would accumulate the normalization mean and corrupt the
+    chunk target.
+    """
+
+    action_delta_alignment: str = "step_wise"
+    action_feature_names: tuple[str, ...] = ()
+
+    def __call__(self, transition):
+        if self.action_delta_alignment == "step_wise":
+            return transition
+        if self.action_delta_alignment != "chunk_wise":
+            raise ValueError(
+                "`action_delta_alignment` must be either 'step_wise' or 'chunk_wise'. "
+                f"Got {self.action_delta_alignment}."
+            )
+
+        action = transition.get(TransitionKey.ACTION)
+        if action is None:
+            return transition
+        if not isinstance(action, PolicyAction):
+            raise ValueError(f"Action should be a PolicyAction type got {type(action)}")
+
+        converted_transition = transition.copy()
+        converted_transition[TransitionKey.ACTION] = convert_stepwise_to_chunkwise_actions(
+            action,
+            self.action_feature_names,
+        )
+        complementary_data = dict(converted_transition.get(TransitionKey.COMPLEMENTARY_DATA) or {})
+        complementary_data[ACT_CHUNKWISE_LABELS_CONVERTED_KEY] = True
+        converted_transition[TransitionKey.COMPLEMENTARY_DATA] = complementary_data
+        return converted_transition
+
+    def transform_features(
+        self, features: dict[PipelineFeatureType, dict[str, PolicyFeature]]
+    ) -> dict[PipelineFeatureType, dict[str, PolicyFeature]]:
+        return features
 
 
 def make_act_pre_post_processors(
@@ -57,13 +111,22 @@ def make_act_pre_post_processors(
         RenameObservationsProcessorStep(rename_map={}),
         AddBatchDimensionProcessorStep(),
         DeviceProcessorStep(device=config.device),
+    ]
+    if config.action_delta_alignment == "chunk_wise":
+        input_steps.append(
+            ACTChunkwiseActionLabelProcessorStep(
+                action_delta_alignment=config.action_delta_alignment,
+                action_feature_names=config.action_feature_names,
+            )
+        )
+    input_steps.append(
         NormalizerProcessorStep(
             features={**config.input_features, **config.output_features},
             norm_map=config.normalization_mapping,
             stats=dataset_stats,
             device=config.device,
-        ),
-    ]
+        )
+    )
     output_steps = [
         UnnormalizerProcessorStep(
             features=config.output_features, norm_map=config.normalization_mapping, stats=dataset_stats
