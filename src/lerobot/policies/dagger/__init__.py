@@ -14,7 +14,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from .configuration_dagger import DAggerPipelineConfig
-from .dagger_trainer import train_dagger
+"""Internal helpers for the round-based DAgger controller.
 
-__all__ = ["DAggerPipelineConfig", "train_dagger"]
+The supported DAgger entry points are:
+- scripts.core.run_dagger_rounds
+- scripts.core.run_dagger_export
+"""
+
+from .configuration_dagger import DAggerDatasetConfig
+
+__all__ = ["DAggerDatasetConfig"]
