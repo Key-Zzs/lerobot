@@ -2,8 +2,21 @@
 
 ## TODOs
 
-- [ ] waiting for dataset to validate act_dagger
-- [ ] refactor dagger to online training
+- [ ] validate the round-based DAgger pipeline on the next collected dataset
+
+## DAgger
+
+当前推荐的 DAgger 主线是轮次式闭环：
+
+```bash
+robot-dagger
+```
+
+单独导出 raw run_mix 日志时使用：
+
+```bash
+python -m scripts.core.run_dagger_export --config dual_arm_data_collection/lerobot_dual_arm_teleop/scripts/config/dagger_rounds_cfg.yaml
+```
 
 ## Config
 
@@ -172,4 +185,3 @@ robot-record
 # 右箭头：停止采集数据
 # enter：继续遥操作
 ```
-
