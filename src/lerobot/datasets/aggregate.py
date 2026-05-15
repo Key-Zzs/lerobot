@@ -19,6 +19,7 @@ import logging
 import shutil
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 import tqdm
 
@@ -474,6 +475,7 @@ def append_or_create_parquet_file(
 
     if not dst_path.exists():
         dst_path.parent.mkdir(parents=True, exist_ok=True)
+        df = normalize_parquet_object_columns(df)
         if contains_images:
             to_parquet_with_hf_images(df, dst_path)
         else:
@@ -494,12 +496,75 @@ def append_or_create_parquet_file(
         final_df = pd.concat([existing_df, df], ignore_index=True)
         target_path = dst_path
 
+    final_df = normalize_parquet_object_columns(final_df)
     if contains_images:
         to_parquet_with_hf_images(final_df, target_path)
     else:
         final_df.to_parquet(target_path)
 
     return idx
+
+
+def _normalize_parquet_value(value):
+    """Convert numpy-backed object values to plain Python containers for pyarrow."""
+    if isinstance(value, np.ndarray):
+        return value.tolist()
+    if isinstance(value, np.generic):
+        return value.item()
+    if isinstance(value, tuple):
+        return [_normalize_parquet_value(item) for item in value]
+    if isinstance(value, list):
+        return [_normalize_parquet_value(item) for item in value]
+    if isinstance(value, dict):
+        return {key: _normalize_parquet_value(item) for key, item in value.items()}
+    return value
+
+
+def _contains_numpy_value(value) -> bool:
+    if isinstance(value, (np.ndarray, np.generic, tuple)):
+        return True
+    if isinstance(value, list):
+        return any(_contains_numpy_value(item) for item in value)
+    if isinstance(value, dict):
+        return any(_contains_numpy_value(item) for item in value.values())
+    return False
+
+
+def _normalize_task_name(value):
+    if isinstance(value, bytes):
+        return value.decode("utf-8")
+    return value
+
+
+def _normalize_tasks_value(value):
+    value = _normalize_parquet_value(value)
+    if isinstance(value, list):
+        return [_normalize_task_name(item) for item in value]
+    if value is None:
+        return []
+    return [_normalize_task_name(value)]
+
+
+def normalize_parquet_object_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """Normalize object columns so pandas/pyarrow can write them consistently.
+
+    Reading list columns from parquet can yield per-cell numpy arrays. If those
+    rows are concatenated with rows containing bytes/strings/lists, pyarrow may
+    infer an incompatible object schema and fail while writing.
+    """
+    object_columns = df.select_dtypes(include=["object"]).columns
+    if len(object_columns) == 0 and "tasks" not in df.columns:
+        return df
+
+    normalized_df = df.copy()
+    if "tasks" in normalized_df.columns:
+        normalized_df["tasks"] = normalized_df["tasks"].map(_normalize_tasks_value)
+
+    for column in object_columns:
+        if normalized_df[column].map(_contains_numpy_value).any():
+            normalized_df[column] = normalized_df[column].map(_normalize_parquet_value)
+
+    return normalized_df
 
 
 def finalize_aggregation(aggr_meta, all_metadata):
