@@ -12,6 +12,9 @@
 robot-dagger
 ```
 
+`robot-dagger` 的 round controller 现在是 policy-agnostic skeleton；
+当前只实现 ACT backend。Diffusion Policy / BC / VLA 需要新增对应 backend 后再接入。
+
 单独导出 raw run_mix 日志时使用：
 
 ```bash
