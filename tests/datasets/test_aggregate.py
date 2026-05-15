@@ -16,10 +16,13 @@
 
 from unittest.mock import patch
 
+import numpy as np
+import pandas as pd
 import torch
 
-from lerobot.datasets.aggregate import aggregate_datasets
+from lerobot.datasets.aggregate import aggregate_datasets, append_or_create_parquet_file
 from lerobot.datasets.lerobot_dataset import LeRobotDataset
+from lerobot.datasets.utils import DEFAULT_EPISODES_PATH
 from tests.fixtures.constants import DUMMY_REPO_ID
 
 
@@ -227,6 +230,55 @@ def assert_video_timestamps_within_bounds(aggr_ds):
                 raise AssertionError(
                     f"Failed to verify timestamps for episode {ep_idx}, {vid_key}: {e}"
                 ) from e
+
+
+def _task_value_to_list(value):
+    if hasattr(value, "tolist"):
+        value = value.tolist()
+    if isinstance(value, str):
+        return [value]
+    return list(value)
+
+
+def test_append_metadata_normalizes_mixed_task_values(tmp_path):
+    """Regression test for mixed scalar/ndarray task metadata during DAgger aggregation."""
+    target_path = tmp_path / DEFAULT_EPISODES_PATH.format(chunk_index=0, file_index=0)
+    target_path.parent.mkdir(parents=True)
+    pd.DataFrame(
+        {
+            "episode_index": [0],
+            "tasks": ["seed task"],
+            "length": [3],
+        }
+    ).to_parquet(target_path)
+
+    source_path = tmp_path / "source.parquet"
+    pd.DataFrame(
+        {
+            "episode_index": [1],
+            "tasks": [["round task"]],
+            "length": [2],
+        }
+    ).to_parquet(source_path)
+
+    append_or_create_parquet_file(
+        pd.DataFrame(
+            {
+                "episode_index": [1],
+                "tasks": [np.array(["round task"], dtype=object)],
+                "length": [2],
+            }
+        ),
+        source_path,
+        {"chunk": 0, "file": 0},
+        max_mb=100,
+        chunk_size=1000,
+        default_path=DEFAULT_EPISODES_PATH,
+        aggr_root=tmp_path,
+    )
+
+    result = pd.read_parquet(target_path)
+    assert [_task_value_to_list(value) for value in result["tasks"]] == [["seed task"], ["round task"]]
 
 
 def test_aggregate_datasets(tmp_path, lerobot_dataset_factory):
