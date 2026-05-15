@@ -20,9 +20,14 @@ import numpy as np
 import pandas as pd
 import torch
 
-from lerobot.datasets.aggregate import aggregate_datasets, append_or_create_parquet_file
+from lerobot.datasets.aggregate import (
+    aggregate_datasets,
+    aggregate_videos,
+    append_or_create_parquet_file,
+    update_meta_data,
+)
 from lerobot.datasets.lerobot_dataset import LeRobotDataset
-from lerobot.datasets.utils import DEFAULT_EPISODES_PATH
+from lerobot.datasets.utils import DEFAULT_EPISODES_PATH, DEFAULT_VIDEO_PATH
 from tests.fixtures.constants import DUMMY_REPO_ID
 
 
@@ -279,6 +284,95 @@ def test_append_metadata_normalizes_mixed_task_values(tmp_path):
 
     result = pd.read_parquet(target_path)
     assert [_task_value_to_list(value) for value in result["tasks"]] == [["seed task"], ["round task"]]
+
+
+def test_aggregate_videos_tracks_rotated_destination_file(tmp_path):
+    video_key = "observation.images.cam"
+    src_root = tmp_path / "src"
+    dst_root = tmp_path / "dst"
+    src_path = src_root / DEFAULT_VIDEO_PATH.format(video_key=video_key, chunk_index=0, file_index=0)
+    dst_path = dst_root / DEFAULT_VIDEO_PATH.format(video_key=video_key, chunk_index=0, file_index=0)
+    src_path.parent.mkdir(parents=True)
+    dst_path.parent.mkdir(parents=True)
+    src_path.write_bytes(b"source")
+    dst_path.write_bytes(b"destination")
+
+    src_meta = type(
+        "SourceMeta",
+        (),
+        {
+            "root": src_root,
+            "episodes": pd.DataFrame(
+                {
+                    f"videos/{video_key}/chunk_index": [0],
+                    f"videos/{video_key}/file_index": [0],
+                }
+            ),
+        },
+    )()
+    dst_meta = type("DestinationMeta", (), {"root": dst_root})()
+    videos_idx = {
+        video_key: {
+            "chunk": 0,
+            "file": 0,
+            "latest_duration": 12.0,
+            "episode_duration": 0,
+        }
+    }
+
+    with patch("lerobot.datasets.aggregate.get_video_duration_in_s", return_value=2.5):
+        result = aggregate_videos(
+            src_meta,
+            dst_meta,
+            videos_idx,
+            video_files_size_in_mb=0,
+            chunk_size=1000,
+        )
+
+    assert result[video_key]["chunk"] == 0
+    assert result[video_key]["file"] == 1
+    assert result[video_key]["latest_duration"] == 2.5
+    assert result[video_key]["src_to_dst"][(0, 0)] == {"chunk": 0, "file": 1, "offset": 0}
+
+
+def test_update_meta_data_uses_per_source_video_destination():
+    video_key = "observation.images.cam"
+    df = pd.DataFrame(
+        {
+            "meta/episodes/chunk_index": [0],
+            "meta/episodes/file_index": [0],
+            "data/chunk_index": [0],
+            "data/file_index": [0],
+            "dataset_from_index": [0],
+            "dataset_to_index": [10],
+            "episode_index": [0],
+            f"videos/{video_key}/chunk_index": [3],
+            f"videos/{video_key}/file_index": [4],
+            f"videos/{video_key}/from_timestamp": [0.5],
+            f"videos/{video_key}/to_timestamp": [1.5],
+        }
+    )
+    dst_meta = type("DestinationMeta", (), {"info": {"total_frames": 100, "total_episodes": 5}})()
+
+    result = update_meta_data(
+        df,
+        dst_meta,
+        meta_idx={"chunk": 0, "file": 0},
+        data_idx={"chunk": 0, "file": 0},
+        videos_idx={
+            video_key: {
+                "chunk": 9,
+                "file": 9,
+                "latest_duration": 20.0,
+                "src_to_dst": {(3, 4): {"chunk": 1, "file": 2, "offset": 7.0}},
+            }
+        },
+    )
+
+    assert result.at[0, f"videos/{video_key}/chunk_index"] == 1
+    assert result.at[0, f"videos/{video_key}/file_index"] == 2
+    assert result.at[0, f"videos/{video_key}/from_timestamp"] == 7.5
+    assert result.at[0, f"videos/{video_key}/to_timestamp"] == 8.5
 
 
 def test_aggregate_datasets(tmp_path, lerobot_dataset_factory):
