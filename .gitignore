@@ -180,8 +180,8 @@ outputs/
 *.part
 
 # repo folders
-dual_arm_teleop-4d884f24376f8352bffcf2d3f72283737d05733a/
-agilex_teleop/
+dual_arm_data_collection/dual_arm_teleop-4d884f24376f8352bffcf2d3f72283737d05733a/
+dual_arm_data_collection/agilex_teleop/
 
 # AI tmp
 .codex
